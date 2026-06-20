@@ -1,0 +1,7 @@
+interface:
+  display_name: "Iterative Performance Optimization"
+  short_description: "Drive measured runtime optimization loops"
+  default_prompt: "Use $iterative-performance-optimization to analyze timing gaps and iterate on runtime bottlenecks."
+
+policy:
+  allow_implicit_invocation: true

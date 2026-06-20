@@ -29,10 +29,31 @@ class YoloInfer : public ModelInferenceBase {
     cv::Rect2f box;
   };
 
+  struct Nv12Frame {
+    const uint8_t* data = nullptr;
+    const uint8_t* y_plane = nullptr;
+    const uint8_t* uv_plane = nullptr;
+    int width = 0;
+    int height = 0;
+    int stride_y = 0;
+    int stride_uv = 0;
+    int crop_x = 0;
+    int crop_y = 0;
+    int crop_width = 0;
+    int crop_height = 0;
+    int source_width = 0;
+    int source_height = 0;
+    int letterbox_pad_x = 0;
+    int letterbox_pad_y = 0;
+    float letterbox_scale = 1.0F;
+    bool preprocessed = false;
+  };
+
   explicit YoloInfer(ModelInferenceBase::Config config);
   YoloInfer(ModelInferenceBase::Config config, Options options);
 
   bool infer(const cv::Mat& image);
+  bool infer(const Nv12Frame& frame);
 
   const Options& options() const;
   const std::vector<Detection>& detections() const;
@@ -60,6 +81,9 @@ class YoloInfer : public ModelInferenceBase {
   bool parseScalePair(const hbDNNTensor& cls_tensor,
                       const hbDNNTensor& reg_tensor, int stride,
                       std::vector<Detection>& proposals) const;
+  bool parseScalePairFloatNhwc(const hbDNNTensor& cls_tensor,
+                               const hbDNNTensor& reg_tensor, int stride,
+                               std::vector<Detection>& proposals) const;
   bool isMultiScaleHead(const TensorList& output_tensors) const;
   size_t tensorOffset(const hbDNNTensor& tensor, int n, int h, int w,
                       int c) const;
@@ -78,6 +102,7 @@ class YoloInfer : public ModelInferenceBase {
   Options options_;
   LetterboxInfo letterbox_;
   std::vector<Detection> detections_;
+  cv::Mat nv12_letterbox_buffer_;
 };
 
 }  // namespace rdk

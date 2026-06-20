@@ -16,9 +16,17 @@ struct Args {
   std::string model_path;
   std::string image_path;
   std::string output_path;
+  bool use_nv12 = false;
+  int bpu_core_id = HB_BPU_CORE_ANY;
   float score_threshold = 0.25F;
   float nms_threshold = 0.45F;
   int num_classes = 80;
+};
+
+struct Nv12Buffer {
+  std::vector<uint8_t> data;
+  int width = 0;
+  int height = 0;
 };
 
 void printUsage(const char* program) {
@@ -26,9 +34,55 @@ void printUsage(const char* program) {
             << " --model model.bin --image image.jpg [options]\n\n"
             << "Options:\n"
             << "  --output result.jpg        save visualization image\n"
+            << "  --nv12                     use NV12 inference path\n"
+            << "  --bpu-core-id N           set hbDNNInferCtrlParam.bpuCoreId\n"
             << "  --score 0.25              score threshold\n"
             << "  --nms 0.45                NMS IoU threshold\n"
             << "  --classes 80              class count\n";
+}
+
+Nv12Buffer bgrToNv12(const cv::Mat& bgr) {
+  Nv12Buffer buffer;
+  buffer.width = bgr.cols;
+  buffer.height = bgr.rows;
+  buffer.data.resize(static_cast<size_t>(buffer.width) * buffer.height * 3 / 2);
+
+  cv::Mat yuv_i420;
+  cv::cvtColor(bgr, yuv_i420, cv::COLOR_BGR2YUV_I420);
+
+  const size_t y_plane_bytes = static_cast<size_t>(buffer.width) * buffer.height;
+  const size_t uv_plane_bytes = y_plane_bytes / 4;
+  const uint8_t* src = yuv_i420.ptr<uint8_t>();
+  std::copy(src, src + y_plane_bytes, buffer.data.begin());
+  const uint8_t* u_plane = src + y_plane_bytes;
+  const uint8_t* v_plane = u_plane + uv_plane_bytes;
+  uint8_t* uv_dst = buffer.data.data() + y_plane_bytes;
+  for (size_t i = 0; i < uv_plane_bytes; ++i) {
+    uv_dst[i * 2] = u_plane[i];
+    uv_dst[i * 2 + 1] = v_plane[i];
+  }
+
+  return buffer;
+}
+
+bool runNv12Infer(rdk::YoloInfer& model, const Nv12Buffer& buffer) {
+  rdk::YoloInfer::Nv12Frame frame;
+  frame.data = buffer.data.data();
+  frame.width = buffer.width;
+  frame.height = buffer.height;
+  frame.stride_y = buffer.width;
+  frame.stride_uv = buffer.width;
+  frame.crop_x = 0;
+  frame.crop_y = 0;
+  frame.crop_width = buffer.width;
+  frame.crop_height = buffer.height;
+  if (buffer.width > 64 && buffer.height > 48) {
+    frame.crop_x = 32;
+    frame.crop_y = 24;
+    frame.crop_width = buffer.width - 64;
+    frame.crop_height = buffer.height - 48;
+  }
+  return model.infer(frame);
 }
 
 bool parseArgs(int argc, char** argv, Args& args) {
@@ -54,6 +108,12 @@ bool parseArgs(int argc, char** argv, Args& args) {
       const char* value = requireValue(key);
       if (value == nullptr) return false;
       args.output_path = value;
+    } else if (key == "--nv12") {
+      args.use_nv12 = true;
+    } else if (key == "--bpu-core-id") {
+      const char* value = requireValue(key);
+      if (value == nullptr) return false;
+      args.bpu_core_id = std::atoi(value);
     } else if (key == "--score") {
       const char* value = requireValue(key);
       if (value == nullptr) return false;
@@ -111,6 +171,7 @@ int main(int argc, char** argv) {
   rdk::ModelInferenceBase::Config config;
   config.model_file = args.model_path;
   config.timeout_ms = 5000;
+  config.bpu_core_id = args.bpu_core_id;
 
   rdk::YoloInfer::Options options;
   options.num_classes = args.num_classes;
@@ -125,9 +186,17 @@ int main(int argc, char** argv) {
 
   std::cout << model.dumpModelInfo() << std::endl;
 
-  if (!model.infer(image)) {
-    std::cerr << "Infer failed: " << model.lastError() << "\n";
-    return 1;
+  if (args.use_nv12) {
+    const Nv12Buffer nv12 = bgrToNv12(image);
+    if (!runNv12Infer(model, nv12)) {
+      std::cerr << "NV12 infer failed: " << model.lastError() << "\n";
+      return 1;
+    }
+  } else {
+    if (!model.infer(image)) {
+      std::cerr << "Infer failed: " << model.lastError() << "\n";
+      return 1;
+    }
   }
 
   const auto& detections = model.detections();

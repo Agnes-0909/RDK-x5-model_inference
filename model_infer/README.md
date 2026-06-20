@@ -59,6 +59,7 @@ model_infer/
 
 - `initialize()`
 - `infer(const cv::Mat& image)`
+- `infer(const YoloInfer::Nv12Frame& frame)`
 - `detections()`
 - `dumpModelInfo()`
 
@@ -134,6 +135,7 @@ OpenCV_DIR=/project/3rdlibrary/opencv_aarch64/lib/cmake/opencv4 ./build.sh
 ./test_yolo_infer \
   --model your_model.bin \
   --image your_image.jpg \
+  --nv12 \
   --output result.jpg \
   --score 0.25 \
   --nms 0.45 \
@@ -179,6 +181,27 @@ if (!infer.infer(image)) {
 const auto& detections = infer.detections();
 ```
 
+如果你的输入已经是 NV12，可以直接走 NV12 原生输入路径，不需要先转成 BGR。`crop + resize` 会在预处理阶段完成。
+
+```cpp
+#include "yolo_infer.hpp"
+
+rdk::YoloInfer::Nv12Frame frame;
+frame.data = nv12_buffer;
+frame.width = 2592;
+frame.height = 1944;
+frame.stride_y = 2592;
+frame.stride_uv = 2592;
+frame.crop_x = 0;
+frame.crop_y = 0;
+frame.crop_width = 2592;
+frame.crop_height = 1944;
+
+if (!infer.infer(frame)) {
+  return -1;
+}
+```
+
 ## 结果展示
 
 ### 输入图像
@@ -193,5 +216,6 @@ const auto& detections = infer.detections();
 
 - 当前构建面向 `aarch64`，不能直接在 x86 主机上运行生成的可执行程序
 - `*.bin` 模型必须与当前推理逻辑的输入约定一致
+- NV12 输入要求宽高、crop 坐标和 crop 尺寸为偶数
 - 若更换模型输出头结构，需要同步调整 `yolo_infer` 的后处理逻辑
 - 若板端缺少运行时依赖，需要正确设置 `LD_LIBRARY_PATH`

@@ -9,5 +9,5 @@ model_convert/onnx2bin/*.log
 model_convert/onnx2bin/*.onnx
 model_convert/pt2onnx/*.onnx
 model_convert/pt2onnx/*.pt
-skills
+skills_tmp_log/
 docs

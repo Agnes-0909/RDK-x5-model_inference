@@ -1,18 +1,34 @@
 #include "yolo_infer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <sstream>
 
 #include <opencv2/imgproc.hpp>
 
+#include "inference_trace.hpp"
+
 namespace rdk {
 namespace {
 
 constexpr uint8_t kLetterboxPadValue = 114;
+constexpr uint8_t kLetterboxUvPadValue = 128;
+
+struct InferInputView {
+  enum class Type {
+    kBgrMat,
+    kNv12Frame,
+  };
+
+  Type type = Type::kBgrMat;
+  const cv::Mat* bgr = nullptr;
+  const YoloInfer::Nv12Frame* nv12 = nullptr;
+};
 
 bool isFloatType(int32_t tensor_type) {
   return tensor_type == HB_DNN_TENSOR_TYPE_F32 ||
@@ -50,6 +66,27 @@ bool tensorHwc(const hbDNNTensorProperties& properties, int& height, int& width,
   return true;
 }
 
+bool resolveInputSize(const hbDNNTensor& tensor, int& input_h, int& input_w) {
+  const auto& shape = tensor.properties.validShape;
+  if (shape.numDimensions != 4) {
+    return false;
+  }
+
+  if (tensor.properties.tensorLayout == HB_DNN_LAYOUT_NCHW) {
+    input_h = shape.dimensionSize[2];
+    input_w = shape.dimensionSize[3];
+    return true;
+  }
+
+  input_h = shape.dimensionSize[1];
+  input_w = shape.dimensionSize[2];
+  return true;
+}
+
+int alignedEven(int value) {
+  return value & ~1;
+}
+
 }  // namespace
 
 YoloInfer::YoloInfer(ModelInferenceBase::Config config)
@@ -60,7 +97,18 @@ YoloInfer::YoloInfer(ModelInferenceBase::Config config, Options options)
 
 bool YoloInfer::infer(const cv::Mat& image) {
   detections_.clear();
-  return ModelInferenceBase::infer(&image);
+  InferInputView input_view;
+  input_view.type = InferInputView::Type::kBgrMat;
+  input_view.bgr = &image;
+  return ModelInferenceBase::infer(&input_view);
+}
+
+bool YoloInfer::infer(const Nv12Frame& frame) {
+  detections_.clear();
+  InferInputView input_view;
+  input_view.type = InferInputView::Type::kNv12Frame;
+  input_view.nv12 = &frame;
+  return ModelInferenceBase::infer(&input_view);
 }
 
 const YoloInfer::Options& YoloInfer::options() const { return options_; }
@@ -92,6 +140,7 @@ std::string YoloInfer::dumpModelInfo() const {
 }
 
 bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
+  const auto preprocess_start = std::chrono::steady_clock::now();
   if (input == nullptr) {
     setLastError("YoloInfer preprocess input is null");
     return false;
@@ -101,36 +150,243 @@ bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
     return false;
   }
 
-  const auto& image = *static_cast<const cv::Mat*>(input);
-  if (image.empty()) {
-    setLastError("input image is empty");
-    return false;
-  }
+  const auto& input_view = *static_cast<const InferInputView*>(input);
 
   hbDNNTensor& tensor = input_tensors[0];
-  const auto& shape = tensor.properties.validShape;
   int input_h = options_.input_height;
   int input_w = options_.input_width;
-  if (isNv12Type(tensor.properties.tensorType) && shape.numDimensions >= 4) {
-    if (tensor.properties.tensorLayout == HB_DNN_LAYOUT_NCHW) {
-      input_h = dimension(shape, 2);
-      input_w = dimension(shape, 3);
-    } else {
-      input_h = dimension(shape, 1);
-      input_w = dimension(shape, 2);
-    }
-  } else if (shape.numDimensions == 4) {
-    if (tensor.properties.tensorLayout == HB_DNN_LAYOUT_NCHW) {
-      input_h = dimension(shape, 2);
-      input_w = dimension(shape, 3);
-    } else {
-      input_h = dimension(shape, 1);
-      input_w = dimension(shape, 2);
-    }
+  if (!resolveInputSize(tensor, input_h, input_w)) {
+    setLastError("unsupported input tensor shape");
+    return false;
   }
   options_.input_height = input_h;
   options_.input_width = input_w;
 
+  if (input_view.type == InferInputView::Type::kNv12Frame) {
+    if (!isNv12Type(tensor.properties.tensorType)) {
+      setLastError("Nv12Frame input requires NV12 model tensor");
+      return false;
+    }
+    if (input_h <= 0 || input_w <= 0 || (input_h % 2) != 0 ||
+        (input_w % 2) != 0) {
+      setLastError("NV12 model tensor requires even input width and height");
+      return false;
+    }
+
+    const Nv12Frame& frame = *input_view.nv12;
+    if (frame.data == nullptr && frame.y_plane == nullptr) {
+      setLastError("Nv12Frame data is null");
+      return false;
+    }
+    if (frame.width <= 0 || frame.height <= 0 || (frame.width % 2) != 0 ||
+        (frame.height % 2) != 0) {
+      setLastError("Nv12Frame width and height must be positive even values");
+      return false;
+    }
+
+    const int stride_y = frame.stride_y > 0 ? frame.stride_y : frame.width;
+    const int stride_uv = frame.stride_uv > 0 ? frame.stride_uv : stride_y;
+    if (stride_y < frame.width || stride_uv < frame.width) {
+      setLastError("Nv12Frame stride is smaller than frame width");
+      return false;
+    }
+
+    const uint8_t* y_plane =
+        frame.y_plane != nullptr ? frame.y_plane : frame.data;
+    const uint8_t* uv_plane = frame.uv_plane != nullptr
+                                  ? frame.uv_plane
+                                  : frame.data + static_cast<size_t>(stride_y) *
+                                                     frame.height;
+
+    if (frame.preprocessed && frame.width == input_w && frame.height == input_h &&
+        frame.source_width > 0 && frame.source_height > 0 &&
+        frame.letterbox_scale > 0.0F) {
+      letterbox_.source_width = frame.source_width;
+      letterbox_.source_height = frame.source_height;
+      letterbox_.scale = frame.letterbox_scale;
+      letterbox_.pad_x = frame.letterbox_pad_x;
+      letterbox_.pad_y = frame.letterbox_pad_y;
+
+      const size_t y_bytes = static_cast<size_t>(input_h) * input_w;
+      const size_t uv_bytes = y_bytes / 2;
+      auto copy_plane_rows = [](uint8_t* dst, const uint8_t* src, int width,
+                                int height, int stride) {
+        for (int row = 0; row < height; ++row) {
+          std::memcpy(dst + static_cast<size_t>(row) * width,
+                      src + static_cast<size_t>(row) * stride, width);
+        }
+      };
+
+      if (tensor.properties.tensorType == HB_DNN_IMG_TYPE_NV12_SEPARATE) {
+        if (tensor.sysMem[0].memSize < y_bytes ||
+            tensor.sysMem[1].memSize < uv_bytes) {
+          setLastError("NV12 separate tensor buffer is smaller than expected");
+          return false;
+        }
+        copy_plane_rows(static_cast<uint8_t*>(tensor.sysMem[0].virAddr), y_plane,
+                        input_w, input_h, stride_y);
+        copy_plane_rows(static_cast<uint8_t*>(tensor.sysMem[1].virAddr), uv_plane,
+                        input_w, input_h / 2, stride_uv);
+        if (!flushTensor(tensor, HB_SYS_MEM_CACHE_CLEAN)) {
+          return false;
+        }
+        const auto preprocess_end = std::chrono::steady_clock::now();
+        std::cout
+            << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+            << " path=nv12_preprocessed_separate total_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   preprocess_end - preprocess_start)
+                   .count()
+            << "\n";
+        return true;
+      }
+
+      if (tensor.sysMem[0].memSize < y_bytes + uv_bytes) {
+        setLastError("NV12 tensor buffer is smaller than expected");
+        return false;
+      }
+      uint8_t* dst = static_cast<uint8_t*>(tensor.sysMem[0].virAddr);
+      copy_plane_rows(dst, y_plane, input_w, input_h, stride_y);
+      copy_plane_rows(dst + y_bytes, uv_plane, input_w, input_h / 2, stride_uv);
+      if (!flushTensor(tensor, HB_SYS_MEM_CACHE_CLEAN)) {
+        return false;
+      }
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout
+          << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+          << " path=nv12_preprocessed_single total_ms="
+          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                 preprocess_end - preprocess_start)
+                 .count()
+          << "\n";
+      return true;
+    }
+
+    const int crop_x = frame.crop_x;
+    const int crop_y = frame.crop_y;
+    const int crop_w =
+        frame.crop_width > 0 ? frame.crop_width : frame.width - crop_x;
+    const int crop_h =
+        frame.crop_height > 0 ? frame.crop_height : frame.height - crop_y;
+    if (crop_x < 0 || crop_y < 0 || crop_w <= 0 || crop_h <= 0 ||
+        crop_x + crop_w > frame.width || crop_y + crop_h > frame.height) {
+      setLastError("Nv12Frame crop rectangle is out of bounds");
+      return false;
+    }
+    if ((crop_x % 2) != 0 || (crop_y % 2) != 0 || (crop_w % 2) != 0 ||
+        (crop_h % 2) != 0) {
+      setLastError("Nv12Frame crop rectangle must use even coordinates and size");
+      return false;
+    }
+
+    letterbox_.source_width = crop_w;
+    letterbox_.source_height = crop_h;
+
+    int resized_w = input_w;
+    int resized_h = input_h;
+    if (options_.keep_ratio) {
+      const float scale =
+          std::min(static_cast<float>(input_w) / static_cast<float>(crop_w),
+                   static_cast<float>(input_h) / static_cast<float>(crop_h));
+      resized_w = std::max(2, alignedEven(static_cast<int>(std::round(
+                                 static_cast<float>(crop_w) * scale))));
+      resized_h = std::max(2, alignedEven(static_cast<int>(std::round(
+                                 static_cast<float>(crop_h) * scale))));
+      resized_w = std::min(resized_w, input_w);
+      resized_h = std::min(resized_h, input_h);
+      letterbox_.scale =
+          std::min(static_cast<float>(resized_w) / static_cast<float>(crop_w),
+                   static_cast<float>(resized_h) / static_cast<float>(crop_h));
+      letterbox_.pad_x = alignedEven((input_w - resized_w) / 2);
+      letterbox_.pad_y = alignedEven((input_h - resized_h) / 2);
+    } else {
+      letterbox_.scale =
+          static_cast<float>(input_w) / static_cast<float>(crop_w);
+      letterbox_.pad_x = 0;
+      letterbox_.pad_y = 0;
+    }
+
+    if (letterbox_.scale <= 0.0F) {
+      setLastError("invalid NV12 letterbox scale");
+      return false;
+    }
+
+    cv::Mat src_y(frame.height, frame.width, CV_8UC1,
+                  const_cast<uint8_t*>(y_plane), stride_y);
+    cv::Mat src_uv(frame.height / 2, frame.width / 2, CV_8UC2,
+                   const_cast<uint8_t*>(uv_plane), stride_uv);
+    cv::Mat cropped_y =
+        src_y(cv::Rect(crop_x, crop_y, crop_w, crop_h));
+    cv::Mat cropped_uv =
+        src_uv(cv::Rect(crop_x / 2, crop_y / 2, crop_w / 2, crop_h / 2));
+
+    cv::Mat resized_y;
+    cv::Mat resized_uv;
+    cv::resize(cropped_y, resized_y, cv::Size(resized_w, resized_h), 0, 0,
+               cv::INTER_LINEAR);
+    cv::resize(cropped_uv, resized_uv,
+               cv::Size(resized_w / 2, resized_h / 2), 0, 0, cv::INTER_LINEAR);
+
+    if (nv12_letterbox_buffer_.rows != input_h * 3 / 2 ||
+        nv12_letterbox_buffer_.cols != input_w ||
+        nv12_letterbox_buffer_.type() != CV_8UC1) {
+      nv12_letterbox_buffer_.create(input_h * 3 / 2, input_w, CV_8UC1);
+    }
+    cv::Mat& nv12 = nv12_letterbox_buffer_;
+    cv::Mat output_y(input_h, input_w, CV_8UC1, nv12.data);
+    cv::Mat output_uv(input_h / 2, input_w / 2, CV_8UC2,
+                      nv12.data + static_cast<size_t>(input_h) * input_w,
+                      input_w);
+    output_y.setTo(cv::Scalar(kLetterboxPadValue));
+    output_uv.setTo(cv::Scalar(kLetterboxUvPadValue, kLetterboxUvPadValue));
+    resized_y.copyTo(output_y(cv::Rect(letterbox_.pad_x, letterbox_.pad_y,
+                                       resized_w, resized_h)));
+    resized_uv.copyTo(output_uv(cv::Rect(letterbox_.pad_x / 2,
+                                         letterbox_.pad_y / 2, resized_w / 2,
+                                         resized_h / 2)));
+
+    const size_t bytes = static_cast<size_t>(input_h) * input_w * 3 / 2;
+    if (tensor.properties.tensorType == HB_DNN_IMG_TYPE_NV12_SEPARATE) {
+      const size_t y_bytes = static_cast<size_t>(input_h) * input_w;
+      const size_t uv_bytes = y_bytes / 2;
+      if (tensor.sysMem[0].memSize < y_bytes ||
+          tensor.sysMem[1].memSize < uv_bytes) {
+        setLastError("NV12 separate tensor buffer is smaller than expected");
+        return false;
+      }
+      std::memcpy(tensor.sysMem[0].virAddr, nv12.data, y_bytes);
+      std::memcpy(tensor.sysMem[1].virAddr, nv12.data + y_bytes, uv_bytes);
+      if (!flushTensor(tensor, HB_SYS_MEM_CACHE_CLEAN)) {
+        return false;
+      }
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+                << " path=nv12_separate total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       preprocess_end - preprocess_start)
+                       .count()
+                << "\n";
+      return true;
+    }
+    const bool ok = copyToInputTensor(0, nv12.data, bytes);
+    if (ok) {
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+                << " path=nv12_single total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       preprocess_end - preprocess_start)
+                       .count()
+                << "\n";
+    }
+    return ok;
+  }
+
+  if (input_view.bgr == nullptr || input_view.bgr->empty()) {
+    setLastError("input image is empty");
+    return false;
+  }
+
+  const auto& image = *input_view.bgr;
   letterbox_.source_width = image.cols;
   letterbox_.source_height = image.rows;
 
@@ -173,7 +429,8 @@ bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
     if (tensor.properties.tensorType == HB_DNN_IMG_TYPE_NV12_SEPARATE) {
       const size_t y_bytes = static_cast<size_t>(input_h) * input_w;
       const size_t uv_bytes = y_bytes / 2;
-      if (tensor.sysMem[0].memSize < y_bytes || tensor.sysMem[1].memSize < uv_bytes) {
+      if (tensor.sysMem[0].memSize < y_bytes ||
+          tensor.sysMem[1].memSize < uv_bytes) {
         setLastError("NV12 separate tensor buffer is smaller than expected");
         return false;
       }
@@ -182,9 +439,26 @@ bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
       if (!flushTensor(tensor, HB_SYS_MEM_CACHE_CLEAN)) {
         return false;
       }
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+                << " path=bgr_to_nv12_separate total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       preprocess_end - preprocess_start)
+                       .count()
+                << "\n";
       return true;
     }
-    return copyToInputTensor(0, nv12.data, bytes);
+    const bool ok = copyToInputTensor(0, nv12.data, bytes);
+    if (ok) {
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+                << " path=bgr_to_nv12_single total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       preprocess_end - preprocess_start)
+                       .count()
+                << "\n";
+    }
+    return ok;
   }
 
   cv::Mat rgb;
@@ -226,8 +500,18 @@ bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
         }
       }
     }
-    return copyToInputTensor(0, buffer.data(),
-                             buffer.size() * sizeof(buffer.front()));
+    const bool ok = copyToInputTensor(0, buffer.data(),
+                                      buffer.size() * sizeof(buffer.front()));
+    if (ok) {
+      const auto preprocess_end = std::chrono::steady_clock::now();
+      std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+                << " path=float total_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       preprocess_end - preprocess_start)
+                       .count()
+                << "\n";
+    }
+    return ok;
   }
 
   std::vector<uint8_t> buffer(element_count);
@@ -251,10 +535,21 @@ bool YoloInfer::preprocess(const void* input, TensorList& input_tensors) {
       }
     }
   }
-  return copyToInputTensor(0, buffer.data(), buffer.size());
+  const bool ok = copyToInputTensor(0, buffer.data(), buffer.size());
+  if (ok) {
+    const auto preprocess_end = std::chrono::steady_clock::now();
+    std::cout << "[perf] [YoloInfer::preprocess] " << FormatInferenceTraceContext()
+              << " path=uint8 total_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     preprocess_end - preprocess_start)
+                     .count()
+              << "\n";
+  }
+  return ok;
 }
 
 bool YoloInfer::postprocess(const TensorList& output_tensors) {
+  const auto postprocess_start = std::chrono::steady_clock::now();
   std::vector<Detection> proposals;
   if (isMultiScaleHead(output_tensors)) {
     if (!parseMultiScaleOutputs(output_tensors, proposals)) {
@@ -270,6 +565,15 @@ bool YoloInfer::postprocess(const TensorList& output_tensors) {
 
   applyNms(proposals);
   detections_ = std::move(proposals);
+  const auto postprocess_end = std::chrono::steady_clock::now();
+  std::cout << "[perf] [YoloInfer::postprocess] "
+            << FormatInferenceTraceContext() << " detections="
+            << detections_.size()
+            << " total_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   postprocess_end - postprocess_start)
+                   .count()
+            << "\n";
   return true;
 }
 
@@ -512,6 +816,15 @@ bool YoloInfer::parseScalePair(const hbDNNTensor& cls_tensor,
     return false;
   }
 
+  if (cls_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_F32 &&
+      reg_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_F32 &&
+      cls_tensor.properties.quantiType == NONE &&
+      reg_tensor.properties.quantiType == NONE &&
+      cls_tensor.properties.tensorLayout == HB_DNN_LAYOUT_NHWC &&
+      reg_tensor.properties.tensorLayout == HB_DNN_LAYOUT_NHWC) {
+    return parseScalePairFloatNhwc(cls_tensor, reg_tensor, stride, proposals);
+  }
+
   const float conf_thres_raw =
       -std::log(1.0F / options_.score_threshold - 1.0F);
 
@@ -559,6 +872,90 @@ bool YoloInfer::parseScalePair(const hbDNNTensor& cls_tensor,
         } else {
           ltrb[side] /= sum;
         }
+      }
+
+      if (ltrb[0] + ltrb[2] <= 0.0F || ltrb[1] + ltrb[3] <= 0.0F) {
+        continue;
+      }
+
+      const float score = sigmoid(best_logit);
+      const float center_x = (static_cast<float>(gw) + 0.5F) * stride;
+      const float center_y = (static_cast<float>(gh) + 0.5F) * stride;
+
+      Detection detection;
+      detection.class_id = best_class;
+      detection.score = score;
+      detection.box =
+          restoreBoxFromCorners(center_x - ltrb[0] * stride,
+                                center_y - ltrb[1] * stride,
+                                center_x + ltrb[2] * stride,
+                                center_y + ltrb[3] * stride);
+      proposals.push_back(detection);
+    }
+  }
+
+  return true;
+}
+
+bool YoloInfer::parseScalePairFloatNhwc(const hbDNNTensor& cls_tensor,
+                                        const hbDNNTensor& reg_tensor,
+                                        int stride,
+                                        std::vector<Detection>& proposals) const {
+  int h = 0;
+  int w = 0;
+  int cls_c = 0;
+  int reg_h = 0;
+  int reg_w = 0;
+  int reg_c = 0;
+  if (!tensorHwc(cls_tensor.properties, h, w, cls_c) ||
+      !tensorHwc(reg_tensor.properties, reg_h, reg_w, reg_c)) {
+    setLastError("failed to parse multi-scale output layout");
+    return false;
+  }
+
+  const float conf_thres_raw =
+      -std::log(1.0F / options_.score_threshold - 1.0F);
+  const float* cls_data = tensorData<const float>(cls_tensor);
+  const float* reg_data = tensorData<const float>(reg_tensor);
+  const size_t cls_step = static_cast<size_t>(cls_c);
+  const size_t reg_step = static_cast<size_t>(reg_c);
+
+  for (int gh = 0; gh < h; ++gh) {
+    for (int gw = 0; gw < w; ++gw) {
+      const size_t offset = (static_cast<size_t>(gh) * static_cast<size_t>(w) +
+                             static_cast<size_t>(gw));
+      const float* cls_ptr = cls_data + offset * cls_step;
+
+      int best_class = 0;
+      float best_logit = cls_ptr[0];
+      for (int c = 1; c < cls_c; ++c) {
+        const float logit = cls_ptr[c];
+        if (logit > best_logit) {
+          best_logit = logit;
+          best_class = c;
+        }
+      }
+
+      if (best_logit < conf_thres_raw) {
+        continue;
+      }
+
+      const float* reg_ptr = reg_data + offset * reg_step;
+      float ltrb[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+      for (int side = 0; side < 4; ++side) {
+        const float* side_ptr = reg_ptr + side * options_.reg;
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (int bin = 0; bin < options_.reg; ++bin) {
+          max_logit = std::max(max_logit, side_ptr[bin]);
+        }
+
+        float sum = 0.0F;
+        for (int bin = 0; bin < options_.reg; ++bin) {
+          const float exp_value = std::exp(side_ptr[bin] - max_logit);
+          ltrb[side] += exp_value * static_cast<float>(bin);
+          sum += exp_value;
+        }
+        ltrb[side] = sum <= 0.0F ? 0.0F : (ltrb[side] / sum);
       }
 
       if (ltrb[0] + ltrb[2] <= 0.0F || ltrb[1] + ltrb[3] <= 0.0F) {

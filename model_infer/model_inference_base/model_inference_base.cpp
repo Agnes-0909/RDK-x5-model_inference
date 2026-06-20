@@ -1,10 +1,13 @@
 #include "model_inference_base.hpp"
 
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 #include <utility>
 
 #include "dnn/hb_sys.h"
+#include "inference_trace.hpp"
 
 namespace rdk {
 namespace {
@@ -67,21 +70,44 @@ bool ModelInferenceBase::infer(const void* input) {
   if (!initialized_ && !initialize()) {
     return false;
   }
+  const auto infer_start = std::chrono::steady_clock::now();
+  const auto preprocess_start = infer_start;
   if (!preprocess(input, input_tensors_)) {
     if (last_error_.empty()) {
       setLastError("preprocess failed");
     }
     return false;
   }
+  const auto preprocess_end = std::chrono::steady_clock::now();
   if (!execute()) {
     return false;
   }
+  const auto execute_end = std::chrono::steady_clock::now();
   if (!postprocess(output_tensors_)) {
     if (last_error_.empty()) {
       setLastError("postprocess failed");
     }
     return false;
   }
+  const auto infer_end = std::chrono::steady_clock::now();
+  std::cout << "[perf] [ModelInferenceBase::infer] "
+            << FormatInferenceTraceContext() << " preprocess_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   preprocess_end - preprocess_start)
+                   .count()
+            << " execute_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   execute_end - preprocess_end)
+                   .count()
+            << " postprocess_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   infer_end - execute_end)
+                   .count()
+            << " total_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   infer_end - infer_start)
+                   .count()
+            << "\n";
   return true;
 }
 
@@ -138,6 +164,7 @@ bool ModelInferenceBase::prepareOutputTensors() {
 }
 
 bool ModelInferenceBase::execute() {
+  const auto execute_start = std::chrono::steady_clock::now();
   hbDNNInferCtrlParam infer_ctrl_param;
   HB_DNN_INITIALIZE_INFER_CTRL_PARAM(&infer_ctrl_param);
   infer_ctrl_param.bpuCoreId = config_.bpu_core_id;
@@ -146,29 +173,53 @@ bool ModelInferenceBase::execute() {
 
   hbDNNTaskHandle_t task_handle = nullptr;
   hbDNNTensor* output = output_tensors_.data();
+  const auto submit_start = execute_start;
   int32_t ret = hbDNNInfer(&task_handle, &output, input_tensors_.data(),
                            dnn_handle_, &infer_ctrl_param);
+  const auto submit_end = std::chrono::steady_clock::now();
   if (ret != 0) {
     setDnnError("hbDNNInfer", ret);
     releaseTask(task_handle);
     return false;
   }
 
+  const auto wait_start = submit_end;
   ret = hbDNNWaitTaskDone(task_handle, config_.timeout_ms);
+  const auto wait_end = std::chrono::steady_clock::now();
   if (ret != 0) {
     setDnnError("hbDNNWaitTaskDone", ret);
     releaseTask(task_handle);
     return false;
   }
 
+  const auto invalidate_start = wait_end;
   for (size_t i = 0; i < output_tensors_.size(); ++i) {
     if (!invalidateOutputTensor(i)) {
       releaseTask(task_handle);
       return false;
     }
   }
+  const auto invalidate_end = std::chrono::steady_clock::now();
 
   releaseTask(task_handle);
+  std::cout << "[perf] [ModelInferenceBase::execute] "
+            << FormatInferenceTraceContext() << " submit_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   submit_end - submit_start)
+                   .count()
+            << " wait_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   wait_end - wait_start)
+                   .count()
+            << " invalidate_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   invalidate_end - invalidate_start)
+                   .count()
+            << " total_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   invalidate_end - execute_start)
+                   .count()
+            << "\n";
   return true;
 }
 

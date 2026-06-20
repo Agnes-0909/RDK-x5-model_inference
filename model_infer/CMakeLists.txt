@@ -37,6 +37,7 @@ set_target_properties(rdk_dnn PROPERTIES
 )
 
 add_library(model_inference_base STATIC
+  model_inference_base/inference_trace.cpp
   model_inference_base/model_inference_base.cpp
 )
 
@@ -83,4 +84,13 @@ endif()
 
 target_link_options(test_yolo_infer PRIVATE
   "-Wl,-rpath-link,${DNN_ROOT}/lib"
+)
+
+add_executable(test_inference_trace
+  test/test_inference_trace.cpp
+)
+
+target_link_libraries(test_inference_trace
+  PRIVATE
+    model_inference_base
 )
