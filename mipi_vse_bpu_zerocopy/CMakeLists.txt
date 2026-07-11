@@ -12,6 +12,7 @@ add_library(mipi_zerocopy_core STATIC
   src/app_config.cpp
   src/bounded_frame_queue.cpp
   src/buffer_layout.cpp
+  src/channel_worker.cpp
   src/detection_mapper.cpp
   src/cleanup_stack.cpp
   src/registered_buffer_cache.cpp
@@ -33,6 +34,10 @@ add_test(NAME test_async_logger COMMAND test_async_logger)
 add_executable(test_bounded_frame_queue test/test_bounded_frame_queue.cpp)
 target_link_libraries(test_bounded_frame_queue PRIVATE mipi_zerocopy_core pthread)
 add_test(NAME test_bounded_frame_queue COMMAND test_bounded_frame_queue)
+
+add_executable(test_channel_worker test/test_channel_worker.cpp)
+target_link_libraries(test_channel_worker PRIVATE mipi_zerocopy_core pthread)
+add_test(NAME test_channel_worker COMMAND test_channel_worker)
 
 add_executable(test_geometry_and_layout test/test_geometry_and_layout.cpp)
 target_link_libraries(test_geometry_and_layout PRIVATE mipi_zerocopy_core)
