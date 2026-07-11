@@ -12,6 +12,7 @@ add_library(mipi_zerocopy_core STATIC
   src/buffer_layout.cpp
   src/detection_mapper.cpp
   src/registered_buffer_cache.cpp
+  src/tensor_binding.cpp
   src/vse_frame.cpp
   src/yolo11_postprocess.cpp
 )
@@ -34,4 +35,23 @@ add_executable(test_yolo11_postprocess test/test_yolo11_postprocess.cpp)
 target_link_libraries(test_yolo11_postprocess PRIVATE mipi_zerocopy_core)
 add_test(NAME test_yolo11_postprocess COMMAND test_yolo11_postprocess)
 
+add_executable(test_tensor_binding test/test_tensor_binding.cpp)
+target_link_libraries(test_tensor_binding PRIVATE mipi_zerocopy_core)
+add_test(NAME test_tensor_binding COMMAND test_tensor_binding)
+
 option(BUILD_HARDWARE_APP "Build the RDK X5 hardware executable" ON)
+
+set(DNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../3rdlibrary/DNN" CACHE PATH
+    "Path to the RDK DNN SDK")
+set(RDK_CAMERA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../3rdlibrary/RDK_CAMERA" CACHE PATH
+    "Path to the RDK Camera SDK")
+
+if(BUILD_HARDWARE_APP)
+  add_library(mipi_zerocopy_dnn STATIC src/zero_copy_yolo_runner.cpp)
+  target_include_directories(mipi_zerocopy_dnn
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${DNN_ROOT}/include)
+  target_link_directories(mipi_zerocopy_dnn PRIVATE ${DNN_ROOT}/lib)
+  target_link_options(mipi_zerocopy_dnn PRIVATE "-Wl,-rpath-link,${DNN_ROOT}/lib")
+  target_link_libraries(mipi_zerocopy_dnn PRIVATE mipi_zerocopy_core dnn)
+endif()
