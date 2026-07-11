@@ -1,8 +1,16 @@
 #include "vio_pipeline.hpp"
 
 #include <cstring>
+#include <arpa/inet.h>
+#include <cstdio>
+#include <fcntl.h>
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
 #include <memory>
 #include <sstream>
+#include <string>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <utility>
 
 #include "hb_camera_interface.h"
@@ -15,6 +23,7 @@ namespace {
 
 struct Pipeline {
   int host = -1;
+  int i2c_bus = -1;
   camera_config_t camera{};
   mipi_config_t mipi{};
   vin_node_attr_t vin_node_attr{};
@@ -51,9 +60,6 @@ void cloneSensorConfig(Pipeline& pipeline, int host) {
   pipeline.isp_attr = *source.isp_attr;
   pipeline.isp_ichn_attr = *source.isp_ichn_attr;
   pipeline.isp_ochn_attr = *source.isp_ochn_attr;
-  pipeline.mipi.rx_attr.phy = host;
-  pipeline.vin_node_attr.cim_attr.mipi_rx = host;
-  pipeline.vin_node_attr.cim_attr.func.ts_src = host + 1;
   pipeline.vin_node_attr.lpwm_attr.enable = 0;
   pipeline.isp_attr.input_mode = 2;
 }
@@ -71,9 +77,115 @@ BufferLayout makeLayout(const hbn_vnode_image_t& image) {
   layout.y_virt = image.buffer.virt_addr[0];
   layout.uv_virt = image.buffer.virt_addr[1];
   layout.plane_count = image.buffer.plane_cnt;
-  layout.format = image.buffer.format == FRM_FMT_NV12 ? PixelFormat::Nv12
-                                                     : PixelFormat::Unknown;
+  layout.format = image.buffer.format == MEM_PIX_FMT_NV12
+                      ? PixelFormat::Nv12
+                      : PixelFormat::Unknown;
   return layout;
+}
+
+bool hostHasMclkConfig(int host) {
+  static const char* const node_suffixes[] = {
+      "3d060000", "3d070000", "3d080000", "3d090000"};
+  if (host < 0 || host >= 4) return false;
+  const std::string path =
+      std::string("/proc/device-tree/soc/cam/mipi_host@") +
+      node_suffixes[host] + "/pinctrl-names";
+  return access(path.c_str(), F_OK) == 0;
+}
+
+bool readBigEndianWord(const std::string& path, std::size_t index,
+                       int& value) {
+  FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) return false;
+  if (std::fseek(file, static_cast<long>(index * sizeof(std::uint32_t)),
+                 SEEK_SET) != 0) {
+    std::fclose(file);
+    return false;
+  }
+  std::uint32_t encoded = 0;
+  const bool ok = std::fread(&encoded, sizeof(encoded), 1, file) == 1;
+  std::fclose(file);
+  if (!ok) return false;
+  value = static_cast<int>(ntohl(encoded));
+  return true;
+}
+
+bool writeSysfs(const std::string& path, const std::string& value) {
+  FILE* file = std::fopen(path.c_str(), "w");
+  if (file == nullptr) return false;
+  const bool ok = std::fputs(value.c_str(), file) >= 0;
+  const bool closed = std::fclose(file) == 0;
+  return ok && closed;
+}
+
+bool pulseSensorPower(int gpio, bool active_high) {
+  if (gpio <= 0) return false;
+  const std::string gpio_path =
+      "/sys/class/gpio/gpio" + std::to_string(gpio);
+  const bool already_exported = access(gpio_path.c_str(), F_OK) == 0;
+  if (!already_exported &&
+      !writeSysfs("/sys/class/gpio/export", std::to_string(gpio))) {
+    return false;
+  }
+  usleep(30 * 1000);
+  if (!writeSysfs(gpio_path + "/direction", "out")) return false;
+  usleep(30 * 1000);
+  for (const int value : sensorPowerSequence(active_high)) {
+    if (!writeSysfs(gpio_path + "/value", std::to_string(value))) return false;
+    usleep(30 * 1000);
+  }
+  if (!already_exported) {
+    return writeSysfs("/sys/class/gpio/unexport", std::to_string(gpio));
+  }
+  return true;
+}
+
+bool readSc132gsChipId(int bus, int address) {
+  const std::string device = "/dev/i2c-" + std::to_string(bus);
+  const int file = open(device.c_str(), O_RDWR);
+  if (file < 0) return false;
+  std::uint8_t register_address[2] = {0x31, 0x07};
+  std::uint8_t response[2] = {};
+  i2c_msg messages[2]{};
+  messages[0].addr = static_cast<__u16>(address);
+  messages[0].flags = 0;
+  messages[0].len = 2;
+  messages[0].buf = register_address;
+  messages[1].addr = static_cast<__u16>(address);
+  messages[1].flags = I2C_M_RD;
+  messages[1].len = 2;
+  messages[1].buf = response;
+  i2c_rdwr_ioctl_data transfer{};
+  transfer.msgs = messages;
+  transfer.nmsgs = 2;
+  const int ret = ioctl(file, I2C_RDWR, &transfer);
+  close(file);
+  if (ret < 0) return false;
+  const int chip_id = (static_cast<int>(response[0]) << 8) | response[1];
+  return chip_id == 0x0132;
+}
+
+bool applyDeviceTreeRouting(Pipeline& pipeline) {
+  const std::string base = "/proc/device-tree/soc/cam/vcon@" +
+                           std::to_string(pipeline.host) + "/";
+  int rx_phy = 0;
+  int lpwm_channel = 0;
+  int reset_gpio = 0;
+  int i2c_bus = 0;
+  if (!readBigEndianWord(base + "rx_phy", 1, rx_phy) ||
+      !readBigEndianWord(base + "lpwm_chn", 0, lpwm_channel) ||
+      !readBigEndianWord(base + "gpio_oth", 0, reset_gpio) ||
+      !readBigEndianWord(base + "bus", 0, i2c_bus)) {
+    return false;
+  }
+  const SensorRouting routing = makeSensorRouting(
+      pipeline.mipi.rx_attr.phy, rx_phy, lpwm_channel);
+  pipeline.mipi.rx_attr.phy = routing.camera_phy;
+  pipeline.vin_node_attr.cim_attr.mipi_rx = routing.vin_rx;
+  pipeline.vin_node_attr.cim_attr.func.ts_src = routing.timestamp_source;
+  pipeline.i2c_bus = i2c_bus;
+  const bool active_high = pipeline.camera.gpio_level_bit == 0;
+  return pulseSensorPower(reset_gpio, active_high);
 }
 
 }  // namespace
@@ -146,6 +258,22 @@ class DualVioPipeline::Impl {
   }
 
   bool initializeOne(Pipeline& pipeline) {
+    if (!applyDeviceTreeRouting(pipeline)) {
+      last_error_ = "failed to read vcon rx_phy/lpwm_chn for host=" +
+                    std::to_string(pipeline.host);
+      return false;
+    }
+    const auto sensor_address = detectSensorAddress(
+        {0x30, 0x32, 0x33}, [&](int address) {
+          return readSc132gsChipId(pipeline.i2c_bus, address);
+        });
+    if (!sensor_address.has_value()) {
+      last_error_ = "SC132GS chip ID 0x0132 was not found on i2c bus=" +
+                    std::to_string(pipeline.i2c_bus) + " host=" +
+                    std::to_string(pipeline.host);
+      return false;
+    }
+    pipeline.camera.addr = static_cast<std::uint32_t>(*sensor_address);
     int ret = hbn_camera_create(&pipeline.camera, &pipeline.camera_handle);
     if (!call("hbn_camera_create", ret, pipeline.host)) return false;
     pipeline.camera_created = true;
@@ -178,11 +306,13 @@ class DualVioPipeline::Impl {
               pipeline.host)) {
       return false;
     }
-    pipeline.vin_attr_ex.ex_attr_type = VIN_STATIC_MCLK_ATTR;
-    if (!call("hbn_vnode_set_attr_ex(VIN MCLK)",
-              hbn_vnode_set_attr_ex(pipeline.vin, &pipeline.vin_attr_ex),
-              pipeline.host)) {
-      return false;
+    if (shouldSetMclkAttribute(hostHasMclkConfig(pipeline.host))) {
+      pipeline.vin_attr_ex.ex_attr_type = VIN_STATIC_MCLK_ATTR;
+      if (!call("hbn_vnode_set_attr_ex(VIN MCLK)",
+                hbn_vnode_set_attr_ex(pipeline.vin, &pipeline.vin_attr_ex),
+                pipeline.host)) {
+        return false;
+      }
     }
 
     ret = hbn_vnode_open(HB_ISP, 0, AUTO_ALLOC_ID, &pipeline.isp);

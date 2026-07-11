@@ -63,6 +63,21 @@ int main() {
   CHECK(unregistrations == 1);
   CHECK(cache.size() == 0);
 
+  int remap_registrations = 0;
+  zerocopy::RegisteredBufferCache remapped_cache(
+      [&](zerocopy::ExternalMemory& memory) {
+        ++remap_registrations;
+        memory.virt_addr = reinterpret_cast<void*>(0x900000);
+        return 0;
+      },
+      [](zerocopy::ExternalMemory&) { return 0; });
+  const auto remapped_first = remapped_cache.getOrRegister(validLayout());
+  const auto remapped_hit = remapped_cache.getOrRegister(validLayout());
+  CHECK(remapped_first.memory.virt_addr == reinterpret_cast<void*>(0x900000));
+  CHECK(remapped_hit.cache_hit);
+  CHECK(remapped_hit.memory.virt_addr == reinterpret_cast<void*>(0x900000));
+  CHECK(remap_registrations == 1);
+
   int releases = 0;
   {
     zerocopy::VseFrame frame(7, validLayout(), [&] {

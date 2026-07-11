@@ -1,5 +1,7 @@
 #include "vio_pipeline.hpp"
 
+#include <array>
+#include <optional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -17,6 +19,28 @@ int failures = 0;
 }  // namespace
 
 int main() {
+  CHECK(!zerocopy::shouldSetMclkAttribute(false));
+  CHECK(zerocopy::shouldSetMclkAttribute(true));
+  const auto host0 = zerocopy::makeSensorRouting(0, 0, 4);
+  CHECK(host0.camera_phy == 0 && host0.vin_rx == 0 && host0.timestamp_source == 5);
+  const auto host2 = zerocopy::makeSensorRouting(0, 2, 5);
+  CHECK(host2.camera_phy == 0 && host2.vin_rx == 2 && host2.timestamp_source == 6);
+  const auto active_high = zerocopy::sensorPowerSequence(true);
+  CHECK((active_high == std::array<int, 3>{1, 0, 1}));
+  const auto active_low = zerocopy::sensorPowerSequence(false);
+  CHECK((active_low == std::array<int, 3>{0, 1, 0}));
+  std::vector<int> probed;
+  const auto address = zerocopy::detectSensorAddress(
+      {0x30, 0x32, 0x33}, [&](int candidate) {
+        probed.push_back(candidate);
+        return candidate == 0x32;
+      });
+  CHECK(address.has_value() && *address == 0x32);
+  CHECK((probed == std::vector<int>{0x30, 0x32}));
+  CHECK(!zerocopy::detectSensorAddress({0x30, 0x33},
+                                       [](int) { return false; })
+             .has_value());
+
   std::vector<std::string> calls;
   {
     zerocopy::CleanupStack cleanup;

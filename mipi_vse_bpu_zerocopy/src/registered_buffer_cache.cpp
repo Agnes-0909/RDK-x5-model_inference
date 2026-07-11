@@ -20,14 +20,17 @@ RegisteredBufferCache::~RegisteredBufferCache() { clear(); }
 RegisteredBuffer RegisteredBufferCache::getOrRegister(
     const BufferLayout& layout) {
   ExternalMemory memory = validateZeroCopyLayout(layout);
-  const auto found = buffers_.find(memory.phy_addr);
+  const std::uint64_t source_phy_addr = memory.phy_addr;
+  void* const source_virt_addr = memory.virt_addr;
+  const std::uint32_t source_bytes = memory.bytes;
+  const auto found = buffers_.find(source_phy_addr);
   if (found != buffers_.end()) {
-    if (found->second.virt_addr != memory.virt_addr ||
-        found->second.bytes != memory.bytes) {
+    if (found->second.source_virt_addr != source_virt_addr ||
+        found->second.source_bytes != source_bytes) {
       throw std::runtime_error(
           "VSE buffer descriptor changed for a registered physical address");
     }
-    return RegisteredBuffer{found->second, true};
+    return RegisteredBuffer{found->second.registered_memory, true};
   }
 
   const int ret = register_memory_(memory);
@@ -36,14 +39,15 @@ RegisteredBuffer RegisteredBufferCache::getOrRegister(
     message << "hbSysRegisterMem failed with code " << ret;
     throw std::runtime_error(message.str());
   }
-  buffers_.emplace(memory.phy_addr, memory);
+  buffers_.emplace(source_phy_addr,
+                   CacheEntry{source_virt_addr, source_bytes, memory});
   return RegisteredBuffer{memory, false};
 }
 
 int RegisteredBufferCache::clear() noexcept {
   int first_error = 0;
   for (auto& entry : buffers_) {
-    const int ret = unregister_memory_(entry.second);
+    const int ret = unregister_memory_(entry.second.registered_memory);
     if (first_error == 0 && ret != 0) first_error = ret;
   }
   buffers_.clear();

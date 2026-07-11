@@ -31,9 +31,15 @@ class RegisteredBufferCache {
   std::size_t size() const noexcept;
 
  private:
+  struct CacheEntry {
+    void* source_virt_addr = nullptr;
+    std::uint32_t source_bytes = 0;
+    ExternalMemory registered_memory;
+  };
+
   MemoryOperation register_memory_;
   MemoryOperation unregister_memory_;
-  std::unordered_map<std::uint64_t, ExternalMemory> buffers_;
+  std::unordered_map<std::uint64_t, CacheEntry> buffers_;
 };
 
 }  // namespace zerocopy
