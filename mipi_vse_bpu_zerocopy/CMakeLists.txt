@@ -13,6 +13,7 @@ add_library(mipi_zerocopy_core STATIC
   src/detection_mapper.cpp
   src/registered_buffer_cache.cpp
   src/vse_frame.cpp
+  src/yolo11_postprocess.cpp
 )
 target_include_directories(mipi_zerocopy_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -28,5 +29,9 @@ add_test(NAME test_geometry_and_layout COMMAND test_geometry_and_layout)
 add_executable(test_resource_lifecycle test/test_resource_lifecycle.cpp)
 target_link_libraries(test_resource_lifecycle PRIVATE mipi_zerocopy_core)
 add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
+
+add_executable(test_yolo11_postprocess test/test_yolo11_postprocess.cpp)
+target_link_libraries(test_yolo11_postprocess PRIVATE mipi_zerocopy_core)
+add_test(NAME test_yolo11_postprocess COMMAND test_yolo11_postprocess)
 
 option(BUILD_HARDWARE_APP "Build the RDK X5 hardware executable" ON)
