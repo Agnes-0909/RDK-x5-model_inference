@@ -74,10 +74,10 @@
 | DNN `release_ms` | `hbDNNReleaseTask` 调用前后 | DNN task 释放；不是 VSE frame release |
 | DNN `total_ms` / worker `bpu_ms` | `hbDNNInfer` 前至 `hbDNNReleaseTask` 后 | **submit + wait + invalidate + release** 及调用间的极小开销 |
 | worker `postprocess_ms` | `Yolo11Postprocessor::run` 内部 | 分类扫描、DFL 解码、坐标映射和 NMS |
-| worker `end_to_end_ms` | worker 出队后、调用 processor 前，至 processor 返回后 | 注册缓存查询/首次注册、BPU 和 CPU 后处理；不含 VSE frame release |
+| worker `end_to_end_ms` | worker 出队后、调用 `processor_->process` 前，至该调用返回后 | 注册缓存查询/首次注册、BPU、CPU 后处理，以及 processor 内日志事件构造和 `AsyncLogger::log` 同步入队；不含 VSE frame release |
 | queue push/pop wait | 相应条件变量等待前后，summary 为逐路累计值 | 容量 1 背压或消费者等帧的累计等待 |
 
-`worker.end_to_end_ms` 不是曝光到检测输出的全链路延迟：它不含 MIPI 曝光、VIN、ISP/VSE 硬件处理、主线程 `hbn_vnode_getframe`、左右取帧配对和入队前/队列等待，也不含处理后的 `hbn_vnode_releaseframe`。日志事件在对应 timer 结束后由异步 logger 提交，因此日志格式化、排队和落盘耗时不计入上述 DNN、postprocess 和 worker timer。
+`worker.end_to_end_ms` 不是曝光到检测输出的全链路延迟：它不含 MIPI 曝光、VIN、ISP/VSE 硬件处理、主线程 `hbn_vnode_getframe`、左右取帧配对和入队前/队列等待，也不含处理后的 `hbn_vnode_releaseframe`。BPU 局部 timer 和 postprocess 局部 timer 均在相应日志事件之前结束，因而排除日志事件开销。与之不同，`end_to_end_ms` 包围整个 `processor_->process` 调用，包含 processor 内 registration、DNN 和 postprocess 事件的字段/对象构造，以及 `AsyncLogger::log` 的同步入队开销（包括 mutex、时间戳处理和队列满时的等待）；它不包含异步 writer 线程中的文本/JSON 序列化和文件 I/O，也不包含 timer 结束后才提交的 `worker.frame_processed` 事件。
 
 ## 6. 测试方法与数据口径
 
@@ -290,7 +290,7 @@ ssh root@192.168.1.12 \
 
 - 只有单次、每路 100 帧的 info 基线，不代表长稳、老化或不同负载下的完整性能认证。
 - 后处理阶段只有每路 2 个 debug 样本，`percentiles_robust=false`，仅能解释机制，不能形成稳定分位数结论。
-- `worker.end_to_end_ms` 从 worker 出队后开始，不包含曝光到 VSE 输出、主线程取帧和排队，也不包含 VSE frame release；当前没有曝光到检测输出的真正全链路时间。
+- `worker.end_to_end_ms` 从 worker 出队后开始，不包含曝光到 VSE 输出、主线程取帧和排队，也不包含 VSE frame release；它包含 processor 内同步日志入队开销，但排除异步 writer 的序列化/文件 I/O 和随后提交的 `worker.frame_processed` 事件。当前没有曝光到检测输出的真正全链路时间。
 - 未记录 BPU/CPU/DDR 频率、温度、功耗模式和功耗数据，不能判断热降频、能效或功耗上限。
 - `wait_ms` 合并了 BPU runtime 排队与执行，现有日志无法量化二者各自占比。
 - 200/200 地址相等与静态门禁只覆盖应用可见路径，不用于宣称 SDK/驱动/硬件内部绝无复制。
