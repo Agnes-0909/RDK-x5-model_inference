@@ -111,7 +111,8 @@ int main(int argc, char** argv) {
   }
   logger.log({zerocopy::LogLevel::kInfo, "app", "startup", "main", "", -1,
               "MIPI-VSE dual zero-copy inference starting",
-              {{"bpu_core", int64_t{zerocopy::kX5BpuCore0}},
+              {{"bpu_core_index", int64_t{0}},
+               {"bpu_core_mask", int64_t{zerocopy::kX5BpuCore0}},
                {"frames_per_channel", int64_t{config.frames}},
                {"left_host", int64_t{config.left_host}},
                {"model", config.model_path},

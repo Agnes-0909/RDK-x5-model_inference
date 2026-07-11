@@ -45,9 +45,10 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
       error = runner_.lastError();
       return false;
     }
-    emit(LogLevel::kInfo, "dnn", "model_loaded", 0,
+    emit(LogLevel::kInfo, "dnn", "model_loaded", -1,
          "independent model instance initialized",
-         {{"bpu_core", int64_t{kX5BpuCore0}}});
+         {{"bpu_core_index", int64_t{0}},
+          {"bpu_core_mask", int64_t{kX5BpuCore0}}});
     return true;
   }
 
@@ -62,7 +63,7 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
     }
     emit(LogLevel::kDebug, "memory",
          registered.cache_hit ? "registration_cache_hit" : "memory_registered",
-         frame.frameId(), "VSE buffer is registered directly with DNN",
+         static_cast<int64_t>(frame.frameId()), "VSE buffer is registered directly with DNN",
          {{"bytes", uint64_t{registered.memory.bytes}},
           {"cache_hit", registered.cache_hit},
           {"physical_address", registered.memory.phy_addr}});
@@ -77,10 +78,11 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
     result.address_match = inference.dnn_input_phy == frame.layout().y_phy;
     result.bpu_ms = inference.bpu_ms;
     result.postprocess_ms = inference.postprocess_ms;
-    emit(LogLevel::kInfo, "dnn", "inference_complete", frame.frameId(),
+    emit(LogLevel::kInfo, "dnn", "inference_complete", static_cast<int64_t>(frame.frameId()),
          "BPU inference completed with VSE address",
          {{"address_match", result.address_match},
-          {"bpu_core", int64_t{inference.bpu.core_id}},
+          {"bpu_core_index", int64_t{inference.bpu.core_index}},
+          {"bpu_core_mask", int64_t{inference.bpu.core_mask}},
           {"dnn_phy", inference.dnn_input_phy},
           {"invalidate_ms", inference.bpu.invalidate_ms},
           {"release_ms", inference.bpu.task_release_ms},
@@ -89,7 +91,7 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
           {"vse_phy", frame.layout().y_phy},
           {"wait_ms", inference.bpu.wait_ms}});
     emit(LogLevel::kDebug, "postprocess", "postprocess_complete",
-         frame.frameId(), "YOLO11 CPU postprocess completed",
+         static_cast<int64_t>(frame.frameId()), "YOLO11 CPU postprocess completed",
          {{"class_scan_ms", inference.postprocess.class_scan_ms},
           {"detections", uint64_t{inference.postprocess.detections}},
           {"dfl_decode_ms", inference.postprocess.dfl_decode_ms},
@@ -108,7 +110,7 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
     const std::size_t count = cache_.size();
     const int result = cache_.clear();
     emit(result == 0 ? LogLevel::kInfo : LogLevel::kError, "memory",
-         "registration_cache_cleared", 0, "registered buffers unregistered",
+         "registration_cache_cleared", -1, "registered buffers unregistered",
          {{"buffers", static_cast<uint64_t>(count)},
           {"result", static_cast<int64_t>(result)}});
     return result;
@@ -116,12 +118,12 @@ class ZeroCopyChannelProcessor final : public ChannelProcessor {
 
  private:
   void emit(LogLevel level, const std::string& component,
-            const std::string& event, uint64_t frame_id,
+            const std::string& event, int64_t frame_id,
             const std::string& message, LogFields fields) noexcept {
     if (logger_ == nullptr) return;
     try {
       logger_->log({level, component, event, channel_ + "-worker", channel_,
-                    frame_id == 0 ? -1 : static_cast<int64_t>(frame_id),
+                    frame_id,
                     message, std::move(fields)});
     } catch (...) {
     }

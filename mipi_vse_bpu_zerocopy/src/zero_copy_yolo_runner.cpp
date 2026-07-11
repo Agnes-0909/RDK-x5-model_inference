@@ -174,7 +174,8 @@ class ZeroCopyYoloRunner::Impl {
     result.bpu.invalidate_ms = elapsedMs(invalidate_start, invalidate_end);
     result.bpu.task_release_ms = elapsedMs(release_start, release_end);
     result.bpu.total_ms = elapsedMs(bpu_start, release_end);
-    result.bpu.core_id = config_.bpu_core_id;
+    result.bpu.core_index = 0;
+    result.bpu.core_mask = config_.bpu_core_id;
     result.bpu_ms = result.bpu.total_ms;
     result.postprocess_ms = result.postprocess.total_ms;
     last_error_.clear();

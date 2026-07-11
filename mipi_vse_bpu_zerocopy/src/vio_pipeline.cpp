@@ -238,7 +238,7 @@ class DualVioPipeline::Impl {
           const int release_result =
               hbn_vnode_releaseframe(handle, 0, owned_image.get());
           emit(release_result == 0 ? LogLevel::kDebug : LogLevel::kError,
-               "frame_released", channel, frame_id,
+               "frame_released", channel, static_cast<int64_t>(frame_id),
                release_result == 0 ? "VSE frame returned after processing"
                                    : "VSE frame release failed",
                {{"result", static_cast<int64_t>(release_result)}});
@@ -246,7 +246,7 @@ class DualVioPipeline::Impl {
         });
     const auto layout = frame.layout();
     emit(LogLevel::kDebug, "frame_acquired", pipeline.channel,
-         image.info.frame_id, "VSE output frame acquired",
+         static_cast<int64_t>(image.info.frame_id), "VSE output frame acquired",
          {{"height", int64_t{layout.height}},
           {"physical_address", layout.y_phy},
           {"width", int64_t{layout.width}}});
@@ -262,15 +262,24 @@ class DualVioPipeline::Impl {
   }
 
   void stop() noexcept {
-    emit(LogLevel::kInfo, "pipeline_stopping", "left", 0,
+    const auto owns_resources = [](const Pipeline& pipeline) {
+      return pipeline.camera_created || pipeline.vin_created ||
+             pipeline.isp_created || pipeline.vse_created ||
+             pipeline.flow_created || pipeline.flow_started;
+    };
+    if (!owns_resources(left_) && !owns_resources(right_)) {
+      initialized_ = false;
+      return;
+    }
+    emit(LogLevel::kInfo, "pipeline_stopping", "left", -1,
          "stopping VIO flow", {});
     stopOne(left_);
-    emit(LogLevel::kInfo, "pipeline_stopped", "left", 0,
+    emit(LogLevel::kInfo, "pipeline_stopped", "left", -1,
          "VIO flow stopped", {});
-    emit(LogLevel::kInfo, "pipeline_stopping", "right", 0,
+    emit(LogLevel::kInfo, "pipeline_stopping", "right", -1,
          "stopping VIO flow", {});
     stopOne(right_);
-    emit(LogLevel::kInfo, "pipeline_stopped", "right", 0,
+    emit(LogLevel::kInfo, "pipeline_stopped", "right", -1,
          "VIO flow stopped", {});
     initialized_ = false;
   }
@@ -281,7 +290,7 @@ class DualVioPipeline::Impl {
   bool call(const char* operation, int ret, int host) {
     const std::string channel = host == left_host_ ? "left" : "right";
     emit(ret == 0 ? LogLevel::kDebug : LogLevel::kError, "sdk_call", channel,
-         0, operation,
+         -1, operation,
          {{"host", static_cast<int64_t>(host)},
           {"result", static_cast<int64_t>(ret)}});
     if (ret == 0) return true;
@@ -292,7 +301,7 @@ class DualVioPipeline::Impl {
   }
 
   bool initializeOne(Pipeline& pipeline) {
-    emit(LogLevel::kInfo, "pipeline_initializing", pipeline.channel, 0,
+    emit(LogLevel::kInfo, "pipeline_initializing", pipeline.channel, -1,
          "configuring MIPI -> VIN -> ISP -> VSE",
          {{"host", static_cast<int64_t>(pipeline.host)}});
     if (!applyDeviceTreeRouting(pipeline)) {
@@ -303,7 +312,7 @@ class DualVioPipeline::Impl {
     const auto sensor_address = detectSensorAddress(
         {0x30, 0x32, 0x33}, [&](int address) {
           const bool found = readSc132gsChipId(pipeline.i2c_bus, address);
-          emit(LogLevel::kDebug, "sensor_probe", pipeline.channel, 0,
+          emit(LogLevel::kDebug, "sensor_probe", pipeline.channel, -1,
                found ? "SC132GS chip ID matched" : "sensor address did not match",
                {{"address", static_cast<int64_t>(address)},
                 {"i2c_bus", static_cast<int64_t>(pipeline.i2c_bus)},
@@ -317,7 +326,7 @@ class DualVioPipeline::Impl {
       return false;
     }
     pipeline.camera.addr = static_cast<std::uint32_t>(*sensor_address);
-    emit(LogLevel::kInfo, "sensor_selected", pipeline.channel, 0,
+    emit(LogLevel::kInfo, "sensor_selected", pipeline.channel, -1,
          "SC132GS chip ID 0x0132 detected",
          {{"address", static_cast<int64_t>(*sensor_address)},
           {"i2c_bus", static_cast<int64_t>(pipeline.i2c_bus)}});
@@ -461,7 +470,7 @@ class DualVioPipeline::Impl {
       return false;
     }
     pipeline.flow_started = true;
-    emit(LogLevel::kInfo, "pipeline_started", pipeline.channel, 0,
+    emit(LogLevel::kInfo, "pipeline_started", pipeline.channel, -1,
          "hardware flow started",
          {{"host", static_cast<int64_t>(pipeline.host)},
           {"vse_height", int64_t{640}}, {"vse_width", int64_t{640}}});
@@ -469,12 +478,12 @@ class DualVioPipeline::Impl {
   }
 
   void emit(LogLevel level, const std::string& event,
-            const std::string& channel, uint64_t frame_id,
+            const std::string& channel, int64_t frame_id,
             const std::string& message, LogFields fields) noexcept {
     if (logger_ == nullptr) return;
     try {
       logger_->log({level, "vio", event, "main", channel,
-                    frame_id == 0 ? -1 : static_cast<int64_t>(frame_id),
+                    frame_id,
                     message, std::move(fields)});
     } catch (...) {
     }

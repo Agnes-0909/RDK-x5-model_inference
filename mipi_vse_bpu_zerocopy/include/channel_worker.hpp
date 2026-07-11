@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -75,7 +76,7 @@ class ChannelWorker {
  private:
   void run() noexcept;
   void recordFailure(uint64_t frame_id, const std::string& error);
-  void emit(LogLevel level, const std::string& event, uint64_t frame_id,
+  void emit(LogLevel level, const std::string& event, int64_t frame_id,
             const std::string& message, LogFields fields = {}) noexcept;
 
   std::string channel_;
@@ -89,6 +90,7 @@ class ChannelWorker {
   bool initialized_ = false;
   bool started_ = false;
   bool processor_shutdown_ = false;
+  std::atomic_bool closed_{false};
   std::thread thread_;
 };
 

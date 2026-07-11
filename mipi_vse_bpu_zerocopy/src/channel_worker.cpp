@@ -63,7 +63,7 @@ QueuePushResult ChannelWorker::enqueue(VseFrame&& frame) {
     stats_.queue_push_wait_ms += result.blocked.count() / 1000.0;
   }
   emit(LogLevel::kDebug, result.accepted ? "frame_enqueued" : "enqueue_closed",
-       frame_id, result.accepted ? "frame moved to worker queue"
+       static_cast<int64_t>(frame_id), result.accepted ? "frame moved to worker queue"
                                  : "worker queue is closed",
        {{"blocked_us", static_cast<int64_t>(result.blocked.count())},
         {"queue_depth", static_cast<uint64_t>(queue_.size())}});
@@ -71,8 +71,9 @@ QueuePushResult ChannelWorker::enqueue(VseFrame&& frame) {
 }
 
 void ChannelWorker::close() noexcept {
+  if (closed_.exchange(true)) return;
   queue_.close();
-  emit(LogLevel::kDebug, "queue_closed", 0, "worker queue closed");
+  emit(LogLevel::kDebug, "queue_closed", -1, "worker queue closed");
 }
 
 void ChannelWorker::join() noexcept {
@@ -99,7 +100,7 @@ std::string ChannelWorker::lastError() const {
 const std::string& ChannelWorker::channel() const noexcept { return channel_; }
 
 void ChannelWorker::run() noexcept {
-  emit(LogLevel::kInfo, "worker_started", 0, "channel worker started");
+  emit(LogLevel::kInfo, "worker_started", -1, "channel worker started");
   while (true) {
     VseFrame frame;
     const auto pop_result = queue_.pop(frame);
@@ -110,7 +111,7 @@ void ChannelWorker::run() noexcept {
     if (!pop_result.has_frame) break;
 
     const uint64_t frame_id = frame.frameId();
-    emit(LogLevel::kDebug, "frame_dequeued", frame_id,
+    emit(LogLevel::kDebug, "frame_dequeued", static_cast<int64_t>(frame_id),
          "worker owns VSE frame",
          {{"blocked_us", static_cast<int64_t>(pop_result.blocked.count())}});
     const auto start = Clock::now();
@@ -151,7 +152,7 @@ void ChannelWorker::run() noexcept {
         stats_.postprocess_ms += result.postprocess_ms;
         stats_.end_to_end_ms += result.end_to_end_ms;
       }
-      emit(LogLevel::kInfo, "frame_processed", frame_id,
+      emit(LogLevel::kInfo, "frame_processed", static_cast<int64_t>(frame_id),
            "inference and postprocess completed",
            {{"address_match", result.address_match},
             {"bpu_ms", result.bpu_ms},
@@ -169,7 +170,7 @@ void ChannelWorker::run() noexcept {
     recordFailure(frame_id, error);
     break;
   }
-  emit(LogLevel::kInfo, "worker_stopped", 0, "channel worker stopped");
+  emit(LogLevel::kInfo, "worker_stopped", -1, "channel worker stopped");
 }
 
 void ChannelWorker::recordFailure(uint64_t frame_id,
@@ -179,18 +180,18 @@ void ChannelWorker::recordFailure(uint64_t frame_id,
     ++stats_.failures;
     if (last_error_.empty()) last_error_ = error;
   }
-  emit(LogLevel::kError, "frame_failed", frame_id, error);
+  emit(LogLevel::kError, "frame_failed", static_cast<int64_t>(frame_id), error);
   queue_.close();
   if (fatal_callback_) fatal_callback_(channel_, frame_id, error);
 }
 
 void ChannelWorker::emit(LogLevel level, const std::string& event,
-                         uint64_t frame_id, const std::string& message,
+                         int64_t frame_id, const std::string& message,
                          LogFields fields) noexcept {
   if (logger_ == nullptr) return;
   try {
     logger_->log({level, "worker", event, channel_ + "-worker", channel_,
-                  frame_id == 0 ? -1 : static_cast<int64_t>(frame_id), message,
+                  frame_id, message,
                   std::move(fields)});
   } catch (...) {
   }

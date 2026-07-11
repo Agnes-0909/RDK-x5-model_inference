@@ -42,7 +42,8 @@ struct InferenceResult {
     double invalidate_ms = 0.0;
     double task_release_ms = 0.0;
     double total_ms = 0.0;
-    int core_id = kX5BpuCore0;
+    int core_index = 0;
+    int core_mask = kX5BpuCore0;
   } bpu;
   PostprocessMetrics postprocess;
 };
