@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
 
 add_library(mipi_zerocopy_core STATIC
+  src/async_logger.cpp
   src/app_config.cpp
   src/buffer_layout.cpp
   src/detection_mapper.cpp
@@ -23,6 +24,10 @@ add_executable(test_app_config test/test_app_config.cpp)
 target_include_directories(test_app_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_app_config PRIVATE mipi_zerocopy_core)
 add_test(NAME test_app_config COMMAND test_app_config)
+
+add_executable(test_async_logger test/test_async_logger.cpp)
+target_link_libraries(test_async_logger PRIVATE mipi_zerocopy_core pthread)
+add_test(NAME test_async_logger COMMAND test_async_logger)
 
 add_executable(test_geometry_and_layout test/test_geometry_and_layout.cpp)
 target_link_libraries(test_geometry_and_layout PRIVATE mipi_zerocopy_core)
