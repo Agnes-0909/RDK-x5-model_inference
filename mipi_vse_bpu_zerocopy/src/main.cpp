@@ -1,122 +1,84 @@
 #include "app_config.hpp"
-#include "registered_buffer_cache.hpp"
+#include "async_logger.hpp"
+#include "dual_channel_coordinator.hpp"
 #include "vio_pipeline.hpp"
-#include "zero_copy_yolo_runner.hpp"
+#include "zero_copy_channel_processor.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <csignal>
-#include <cstdint>
-#include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-#include "dnn/hb_sys.h"
 #include "hb_mem_mgr.h"
 
 namespace {
 
-std::atomic_bool stop_requested{false};
+std::atomic_bool signal_stop_requested{false};
 
-void handleSignal(int) { stop_requested.store(true); }
+void handleSignal(int) { signal_stop_requested.store(true); }
 
-int registerMemory(zerocopy::ExternalMemory& memory) {
-  hbSysMem descriptor{};
-  descriptor.phyAddr = memory.phy_addr;
-  descriptor.virAddr = memory.virt_addr;
-  descriptor.memSize = memory.bytes;
-  const int ret = hbSysRegisterMem(&descriptor);
-  if (ret == 0) {
-    memory.phy_addr = descriptor.phyAddr;
-    memory.virt_addr = descriptor.virAddr;
-    memory.bytes = descriptor.memSize;
-    memory.total_bytes = descriptor.memSize;
-  }
-  return ret;
+double average(double total, uint64_t count) {
+  return count == 0 ? 0.0 : total / static_cast<double>(count);
 }
 
-int unregisterMemory(zerocopy::ExternalMemory& memory) {
-  hbSysMem descriptor{};
-  descriptor.phyAddr = memory.phy_addr;
-  descriptor.virAddr = memory.virt_addr;
-  descriptor.memSize = memory.bytes;
-  return hbSysUnregisterMem(&descriptor);
+std::string jsonEscape(const std::string& value) {
+  std::string result;
+  for (const char character : value) {
+    if (character == '"' || character == '\\') result.push_back('\\');
+    if (character == '\n') {
+      result += "\\n";
+    } else {
+      result.push_back(character);
+    }
+  }
+  return result;
 }
 
-struct ChannelStats {
-  int successes = 0;
-  int timeouts = 0;
-  std::size_t detections = 0;
-  double bpu_ms = 0.0;
-  double postprocess_ms = 0.0;
-};
-
-void printResult(const char* channel, const zerocopy::VseFrame& frame,
-                 const zerocopy::RegisteredBuffer& registered,
-                 const zerocopy::InferenceResult& result) {
-  std::cout << "frame channel=" << channel << " id=" << frame.frameId()
-            << " vse_phy=0x" << std::hex << frame.layout().y_phy
-            << " dnn_phy=0x" << result.dnn_input_phy << std::dec
-            << " cache_hit=" << (registered.cache_hit ? 1 : 0)
-            << " bpu_ms=" << std::fixed << std::setprecision(3)
-            << result.bpu_ms << " postprocess_ms=" << result.postprocess_ms
-            << " detections=" << result.detections.size() << '\n';
-  for (const auto& detection : result.detections) {
-    std::cout << "  detection channel=" << channel
-              << " class=" << detection.class_id
-              << " score=" << detection.score << " box=[" << detection.box.x1
-              << ',' << detection.box.y1 << ',' << detection.box.x2 << ','
-              << detection.box.y2 << "]\n";
-  }
+void writeChannel(std::ostream& output, const zerocopy::ChannelStats& stats) {
+  output << "{\"successes\":" << stats.successes
+         << ",\"failures\":" << stats.failures
+         << ",\"detections\":" << stats.detections
+         << ",\"cache_hits\":" << stats.cache_hits
+         << ",\"cache_misses\":" << stats.cache_misses
+         << ",\"address_mismatches\":" << stats.address_mismatches
+         << ",\"release_errors\":" << stats.release_errors
+         << ",\"avg_bpu_ms\":" << average(stats.bpu_ms, stats.successes)
+         << ",\"avg_postprocess_ms\":"
+         << average(stats.postprocess_ms, stats.successes)
+         << ",\"avg_end_to_end_ms\":"
+         << average(stats.end_to_end_ms, stats.successes)
+         << ",\"queue_push_wait_ms\":" << stats.queue_push_wait_ms
+         << ",\"queue_pop_wait_ms\":" << stats.queue_pop_wait_ms << '}';
 }
 
-bool inferFrame(const char* channel, zerocopy::VseFrame& frame,
-                zerocopy::RegisteredBufferCache& cache,
-                zerocopy::ZeroCopyYoloRunner& runner, ChannelStats& stats) {
-  const auto registered = cache.getOrRegister(frame.layout());
-  zerocopy::InferenceResult result;
-  if (!runner.infer(registered.memory, result)) {
-    std::cerr << "BPU inference failed channel=" << channel
-              << " frame_id=" << frame.frameId()
-              << " error=" << runner.lastError() << '\n';
-    return false;
-  }
-  if (result.dnn_input_phy != frame.layout().y_phy) {
-    throw std::runtime_error(
-        "zero-copy proof failed: VSE and DNN physical addresses differ");
-  }
-  printResult(channel, frame, registered, result);
-  ++stats.successes;
-  stats.detections += result.detections.size();
-  stats.bpu_ms += result.bpu_ms;
-  stats.postprocess_ms += result.postprocess_ms;
-  const int release_ret = frame.release();
-  if (release_ret != 0) {
-    throw std::runtime_error("hbn_vnode_releaseframe failed with code " +
-                             std::to_string(release_ret));
-  }
-  return true;
+void writeSummary(const std::string& directory,
+                  const zerocopy::DualChannelSummary& summary,
+                  uint64_t left_timeouts, uint64_t right_timeouts,
+                  int exit_code, const std::string& error) {
+  std::ofstream output(directory + "/summary.json", std::ios::trunc);
+  if (!output) throw std::runtime_error("cannot write summary.json");
+  output << "{\n  \"exit_code\": " << exit_code
+         << ",\n  \"error\": \"" << jsonEscape(error)
+         << "\",\n  \"left_timeouts\": " << left_timeouts
+         << ",\n  \"right_timeouts\": " << right_timeouts
+         << ",\n  \"left\": ";
+  writeChannel(output, summary.left);
+  output << ",\n  \"right\": ";
+  writeChannel(output, summary.right);
+  output << "\n}\n";
 }
 
-void printSummary(const ChannelStats& left, const ChannelStats& right,
-                  std::size_t registered_buffers) {
-  auto average = [](double total, int count) {
-    return count == 0 ? 0.0 : total / static_cast<double>(count);
-  };
-  std::cout << "summary left_success=" << left.successes
-            << " right_success=" << right.successes
-            << " left_timeouts=" << left.timeouts
-            << " right_timeouts=" << right.timeouts
-            << " left_detections=" << left.detections
-            << " right_detections=" << right.detections
-            << " left_avg_bpu_ms=" << average(left.bpu_ms, left.successes)
-            << " right_avg_bpu_ms=" << average(right.bpu_ms, right.successes)
-            << " left_avg_post_ms="
-            << average(left.postprocess_ms, left.successes)
-            << " right_avg_post_ms="
-            << average(right.postprocess_ms, right.successes)
-            << " registered_buffers=" << registered_buffers << '\n';
+zerocopy::ZeroCopyYoloRunner::Config runnerConfig(
+    const zerocopy::AppConfig& config) {
+  zerocopy::ZeroCopyYoloRunner::Config result;
+  result.model_path = config.model_path;
+  result.timeout_ms = config.dnn_timeout_ms;
+  result.score_threshold = config.score_threshold;
+  result.nms_threshold = config.nms_threshold;
+  result.bpu_core_id = zerocopy::kX5BpuCore0;
+  return result;
 }
 
 }  // namespace
@@ -134,87 +96,144 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  std::signal(SIGINT, handleSignal);
-  std::signal(SIGTERM, handleSignal);
-  const int mem_ret = hb_mem_module_open();
-  if (mem_ret != 0) {
-    std::cerr << "hb_mem_module_open failed with code " << mem_ret << '\n';
+  zerocopy::LoggerConfig logger_config;
+  logger_config.directory = config.log_dir;
+  logger_config.min_level = config.log_level;
+  logger_config.max_bytes =
+      static_cast<uint64_t>(config.log_max_mb) * 1024ULL * 1024ULL;
+  logger_config.max_files = config.log_files;
+  zerocopy::AsyncLogger logger(logger_config);
+  try {
+    logger.start();
+  } catch (const std::exception& error) {
+    std::cerr << "logger initialization failed: " << error.what() << '\n';
     return 1;
   }
+  logger.log({zerocopy::LogLevel::kInfo, "app", "startup", "main", "", -1,
+              "MIPI-VSE dual zero-copy inference starting",
+              {{"bpu_core", int64_t{zerocopy::kX5BpuCore0}},
+               {"frames_per_channel", int64_t{config.frames}},
+               {"left_host", int64_t{config.left_host}},
+               {"model", config.model_path},
+               {"right_host", int64_t{config.right_host}}}});
 
+  std::signal(SIGINT, handleSignal);
+  std::signal(SIGTERM, handleSignal);
   int exit_code = 0;
-  ChannelStats left_stats;
-  ChannelStats right_stats;
-  std::size_t registered_count = 0;
-  {
-    zerocopy::ZeroCopyYoloRunner runner(
-        {config.model_path, config.dnn_timeout_ms, config.score_threshold,
-         config.nms_threshold});
-    zerocopy::DualVioPipeline pipelines(config.left_host, config.right_host);
-    zerocopy::RegisteredBufferCache cache(registerMemory, unregisterMemory);
-    try {
-      if (!runner.initialize()) {
-        throw std::runtime_error("DNN initialization failed: " +
-                                 runner.lastError());
-      }
-      if (!pipelines.initialize()) {
-        throw std::runtime_error("VIO initialization failed: " +
-                                 pipelines.lastError());
+  std::string fatal_error;
+  uint64_t left_timeouts = 0;
+  uint64_t right_timeouts = 0;
+  zerocopy::DualChannelSummary summary;
+
+  const int memory_result = hb_mem_module_open();
+  if (memory_result != 0) {
+    fatal_error = "hb_mem_module_open failed with code " +
+                  std::to_string(memory_result);
+    exit_code = 1;
+  } else {
+    {
+      auto left_processor = zerocopy::makeZeroCopyChannelProcessor(
+          "left", runnerConfig(config), &logger);
+      auto right_processor = zerocopy::makeZeroCopyChannelProcessor(
+          "right", runnerConfig(config), &logger);
+      zerocopy::DualChannelCoordinator coordinator(
+          std::move(left_processor), std::move(right_processor), &logger);
+      zerocopy::DualVioPipeline pipelines(config.left_host, config.right_host,
+                                           &logger);
+      bool vio_initialized = false;
+      try {
+        if (!coordinator.initialize()) {
+          throw std::runtime_error("model initialization failed: " +
+                                   coordinator.lastError());
+        }
+        logger.log({zerocopy::LogLevel::kInfo, "app", "models_ready", "main",
+                    "", -1, "left and right model instances initialized", {}});
+        if (!pipelines.initialize()) {
+          throw std::runtime_error("VIO initialization failed: " +
+                                   pipelines.lastError());
+        }
+        vio_initialized = true;
+        logger.log({zerocopy::LogLevel::kInfo, "vio", "pipelines_started",
+                    "main", "", -1,
+                    "MIPI -> ISP -> VSE hardware flows started", {}});
+        coordinator.start();
+
+        uint64_t dispatched = 0;
+        int consecutive_timeouts = 0;
+        while (!signal_stop_requested.load() && !coordinator.stopRequested() &&
+               (config.frames == 0 || dispatched <
+                  static_cast<uint64_t>(config.frames))) {
+          zerocopy::VseFrame left_frame;
+          zerocopy::VseFrame right_frame;
+          const bool left_ok =
+              pipelines.acquireLeft(config.frame_timeout_ms, left_frame);
+          if (!left_ok) ++left_timeouts;
+          const bool right_ok =
+              pipelines.acquireRight(config.frame_timeout_ms, right_frame);
+          if (!right_ok) ++right_timeouts;
+          if (!left_ok || !right_ok) {
+            ++consecutive_timeouts;
+            logger.log({zerocopy::LogLevel::kWarn, "vio", "acquire_timeout",
+                        "main", "", -1, pipelines.lastError(),
+                        {{"consecutive", int64_t{consecutive_timeouts}},
+                         {"left_ok", left_ok}, {"right_ok", right_ok}}});
+            if (consecutive_timeouts >= config.max_consecutive_timeouts) {
+              throw std::runtime_error("too many consecutive frame timeouts");
+            }
+            continue;
+          }
+          consecutive_timeouts = 0;
+          if (!coordinator.enqueuePair(std::move(left_frame),
+                                       std::move(right_frame))) {
+            break;
+          }
+          ++dispatched;
+        }
+        coordinator.close();
+        coordinator.join();
+        if (coordinator.stopRequested()) {
+          throw std::runtime_error(coordinator.lastError());
+        }
+      } catch (const std::exception& error) {
+        fatal_error = error.what();
+        exit_code = 1;
+        coordinator.close();
+        coordinator.join();
+        logger.log({zerocopy::LogLevel::kError, "app", "fatal_unwind", "main",
+                    "", -1, fatal_error, {}});
       }
 
-      int consecutive_timeouts = 0;
-      while (!stop_requested.load() &&
-             (config.frames == 0 || left_stats.successes < config.frames ||
-              right_stats.successes < config.frames)) {
-        zerocopy::VseFrame left_frame;
-        zerocopy::VseFrame right_frame;
-        bool left_ok = left_stats.successes >= config.frames && config.frames > 0;
-        bool right_ok =
-            right_stats.successes >= config.frames && config.frames > 0;
-        if (!left_ok) {
-          left_ok = pipelines.acquireLeft(config.frame_timeout_ms, left_frame);
-          if (!left_ok) ++left_stats.timeouts;
-        }
-        if (!right_ok) {
-          right_ok = pipelines.acquireRight(config.frame_timeout_ms, right_frame);
-          if (!right_ok) ++right_stats.timeouts;
-        }
-        if (!left_ok || !right_ok) {
-          ++consecutive_timeouts;
-          std::cerr << "frame acquisition failed: " << pipelines.lastError()
-                    << " consecutive=" << consecutive_timeouts << '\n';
-          if (consecutive_timeouts >= config.max_consecutive_timeouts) {
-            throw std::runtime_error("too many consecutive frame timeouts");
-          }
-          continue;
-        }
-        consecutive_timeouts = 0;
-        if (left_frame.valid() &&
-            !inferFrame("left", left_frame, cache, runner, left_stats)) {
-          throw std::runtime_error("left inference failed");
-        }
-        if (right_frame.valid() &&
-            !inferFrame("right", right_frame, cache, runner, right_stats)) {
-          throw std::runtime_error("right inference failed");
-        }
+      summary = coordinator.summary();
+      const int unregister_result = coordinator.shutdownProcessors();
+      if (unregister_result != 0 && exit_code == 0) {
+        fatal_error = "buffer unregistration failed with code " +
+                      std::to_string(unregister_result);
+        exit_code = 1;
       }
-      registered_count = cache.size();
-      printSummary(left_stats, right_stats, registered_count);
-      const int unregister_ret = cache.clear();
-      if (unregister_ret != 0) {
-        throw std::runtime_error("hbSysUnregisterMem failed with code " +
-                                 std::to_string(unregister_ret));
-      }
-      pipelines.stop();
-    } catch (const std::exception& error) {
-      registered_count = cache.size();
-      std::cerr << "fatal: " << error.what() << '\n';
-      printSummary(left_stats, right_stats, registered_count);
-      cache.clear();
-      pipelines.stop();
-      exit_code = 1;
+      if (vio_initialized) pipelines.stop();
+      logger.log({zerocopy::LogLevel::kInfo, "vio", "pipelines_stopped",
+                  "main", "", -1, "VIO hardware resources stopped", {}});
     }
+    hb_mem_module_close();
   }
-  hb_mem_module_close();
+
+  try {
+    writeSummary(config.log_dir, summary, left_timeouts, right_timeouts,
+                 exit_code, fatal_error);
+  } catch (const std::exception& error) {
+    logger.log({zerocopy::LogLevel::kError, "summary", "write_failed", "main",
+                "", -1, error.what(), {}});
+    exit_code = 1;
+  }
+  logger.log({zerocopy::LogLevel::kInfo, "summary", "run_complete", "main",
+              "", -1, exit_code == 0 ? "run completed" : "run failed",
+              {{"address_mismatches",
+                summary.left.address_mismatches +
+                    summary.right.address_mismatches},
+               {"errors", summary.left.failures + summary.right.failures},
+               {"exit_code", int64_t{exit_code}},
+               {"left_success", summary.left.successes},
+               {"right_success", summary.right.successes}}});
+  logger.shutdown();
   return exit_code;
 }

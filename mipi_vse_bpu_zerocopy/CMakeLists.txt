@@ -14,6 +14,7 @@ add_library(mipi_zerocopy_core STATIC
   src/buffer_layout.cpp
   src/channel_worker.cpp
   src/detection_mapper.cpp
+  src/dual_channel_coordinator.cpp
   src/cleanup_stack.cpp
   src/registered_buffer_cache.cpp
   src/tensor_binding.cpp
@@ -38,6 +39,12 @@ add_test(NAME test_bounded_frame_queue COMMAND test_bounded_frame_queue)
 add_executable(test_channel_worker test/test_channel_worker.cpp)
 target_link_libraries(test_channel_worker PRIVATE mipi_zerocopy_core pthread)
 add_test(NAME test_channel_worker COMMAND test_channel_worker)
+
+add_executable(test_dual_channel_coordinator
+  test/test_dual_channel_coordinator.cpp)
+target_link_libraries(test_dual_channel_coordinator PRIVATE
+  mipi_zerocopy_core pthread)
+add_test(NAME test_dual_channel_coordinator COMMAND test_dual_channel_coordinator)
 
 add_executable(test_geometry_and_layout test/test_geometry_and_layout.cpp)
 target_link_libraries(test_geometry_and_layout PRIVATE mipi_zerocopy_core)
@@ -73,6 +80,7 @@ set(RDK_CAMERA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../3rdlibrary/RDK_CAMERA" CACHE
 
 if(BUILD_HARDWARE_APP)
   add_library(mipi_zerocopy_dnn STATIC
+    src/zero_copy_channel_processor.cpp
     src/zero_copy_yolo_runner.cpp
     src/vio_pipeline.cpp
     src/sensor/sc132gs_linear_1088x1280_raw10_30fps_1lane.c

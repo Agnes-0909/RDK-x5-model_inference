@@ -12,6 +12,8 @@
 
 namespace zerocopy {
 
+class AsyncLogger;
+
 bool shouldSetMclkAttribute(bool device_tree_has_pinctrl_names) noexcept;
 
 struct SensorRouting {
@@ -40,7 +42,7 @@ class CleanupStack {
 
 class DualVioPipeline {
  public:
-  DualVioPipeline(int left_host, int right_host);
+  DualVioPipeline(int left_host, int right_host, AsyncLogger* logger = nullptr);
   ~DualVioPipeline();
 
   DualVioPipeline(const DualVioPipeline&) = delete;

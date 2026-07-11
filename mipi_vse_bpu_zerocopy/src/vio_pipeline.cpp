@@ -1,5 +1,7 @@
 #include "vio_pipeline.hpp"
 
+#include "async_logger.hpp"
+
 #include <cstring>
 #include <arpa/inet.h>
 #include <cstdio>
@@ -22,6 +24,7 @@ namespace zerocopy {
 namespace {
 
 struct Pipeline {
+  std::string channel;
   int host = -1;
   int i2c_bus = -1;
   camera_config_t camera{};
@@ -192,8 +195,11 @@ bool applyDeviceTreeRouting(Pipeline& pipeline) {
 
 class DualVioPipeline::Impl {
  public:
-  Impl(int left_host, int right_host)
-      : left_host_(left_host), right_host_(right_host) {}
+  Impl(int left_host, int right_host, AsyncLogger* logger)
+      : left_host_(left_host), right_host_(right_host), logger_(logger) {
+    left_.channel = "left";
+    right_.channel = "right";
+  }
 
   ~Impl() { stop(); }
 
@@ -226,9 +232,24 @@ class DualVioPipeline::Impl {
     auto owned_image = std::make_shared<hbn_vnode_image_t>(image);
     const hbn_vnode_handle_t handle = pipeline.vse;
     frame = VseFrame(
-        image.info.frame_id, makeLayout(image), [handle, owned_image] {
-          return hbn_vnode_releaseframe(handle, 0, owned_image.get());
+        image.info.frame_id, makeLayout(image),
+        [this, handle, owned_image, channel = pipeline.channel,
+         frame_id = image.info.frame_id] {
+          const int release_result =
+              hbn_vnode_releaseframe(handle, 0, owned_image.get());
+          emit(release_result == 0 ? LogLevel::kDebug : LogLevel::kError,
+               "frame_released", channel, frame_id,
+               release_result == 0 ? "VSE frame returned after processing"
+                                   : "VSE frame release failed",
+               {{"result", static_cast<int64_t>(release_result)}});
+          return release_result;
         });
+    const auto layout = frame.layout();
+    emit(LogLevel::kDebug, "frame_acquired", pipeline.channel,
+         image.info.frame_id, "VSE output frame acquired",
+         {{"height", int64_t{layout.height}},
+          {"physical_address", layout.y_phy},
+          {"width", int64_t{layout.width}}});
     last_error_.clear();
     return true;
   }
@@ -241,8 +262,16 @@ class DualVioPipeline::Impl {
   }
 
   void stop() noexcept {
+    emit(LogLevel::kInfo, "pipeline_stopping", "left", 0,
+         "stopping VIO flow", {});
     stopOne(left_);
+    emit(LogLevel::kInfo, "pipeline_stopped", "left", 0,
+         "VIO flow stopped", {});
+    emit(LogLevel::kInfo, "pipeline_stopping", "right", 0,
+         "stopping VIO flow", {});
     stopOne(right_);
+    emit(LogLevel::kInfo, "pipeline_stopped", "right", 0,
+         "VIO flow stopped", {});
     initialized_ = false;
   }
 
@@ -250,6 +279,11 @@ class DualVioPipeline::Impl {
 
  private:
   bool call(const char* operation, int ret, int host) {
+    const std::string channel = host == left_host_ ? "left" : "right";
+    emit(ret == 0 ? LogLevel::kDebug : LogLevel::kError, "sdk_call", channel,
+         0, operation,
+         {{"host", static_cast<int64_t>(host)},
+          {"result", static_cast<int64_t>(ret)}});
     if (ret == 0) return true;
     std::ostringstream message;
     message << operation << "(host=" << host << ") failed with code " << ret;
@@ -258,6 +292,9 @@ class DualVioPipeline::Impl {
   }
 
   bool initializeOne(Pipeline& pipeline) {
+    emit(LogLevel::kInfo, "pipeline_initializing", pipeline.channel, 0,
+         "configuring MIPI -> VIN -> ISP -> VSE",
+         {{"host", static_cast<int64_t>(pipeline.host)}});
     if (!applyDeviceTreeRouting(pipeline)) {
       last_error_ = "failed to read vcon rx_phy/lpwm_chn for host=" +
                     std::to_string(pipeline.host);
@@ -265,7 +302,13 @@ class DualVioPipeline::Impl {
     }
     const auto sensor_address = detectSensorAddress(
         {0x30, 0x32, 0x33}, [&](int address) {
-          return readSc132gsChipId(pipeline.i2c_bus, address);
+          const bool found = readSc132gsChipId(pipeline.i2c_bus, address);
+          emit(LogLevel::kDebug, "sensor_probe", pipeline.channel, 0,
+               found ? "SC132GS chip ID matched" : "sensor address did not match",
+               {{"address", static_cast<int64_t>(address)},
+                {"i2c_bus", static_cast<int64_t>(pipeline.i2c_bus)},
+                {"matched", found}});
+          return found;
         });
     if (!sensor_address.has_value()) {
       last_error_ = "SC132GS chip ID 0x0132 was not found on i2c bus=" +
@@ -274,6 +317,10 @@ class DualVioPipeline::Impl {
       return false;
     }
     pipeline.camera.addr = static_cast<std::uint32_t>(*sensor_address);
+    emit(LogLevel::kInfo, "sensor_selected", pipeline.channel, 0,
+         "SC132GS chip ID 0x0132 detected",
+         {{"address", static_cast<int64_t>(*sensor_address)},
+          {"i2c_bus", static_cast<int64_t>(pipeline.i2c_bus)}});
     int ret = hbn_camera_create(&pipeline.camera, &pipeline.camera_handle);
     if (!call("hbn_camera_create", ret, pipeline.host)) return false;
     pipeline.camera_created = true;
@@ -414,7 +461,23 @@ class DualVioPipeline::Impl {
       return false;
     }
     pipeline.flow_started = true;
+    emit(LogLevel::kInfo, "pipeline_started", pipeline.channel, 0,
+         "hardware flow started",
+         {{"host", static_cast<int64_t>(pipeline.host)},
+          {"vse_height", int64_t{640}}, {"vse_width", int64_t{640}}});
     return true;
+  }
+
+  void emit(LogLevel level, const std::string& event,
+            const std::string& channel, uint64_t frame_id,
+            const std::string& message, LogFields fields) noexcept {
+    if (logger_ == nullptr) return;
+    try {
+      logger_->log({level, "vio", event, "main", channel,
+                    frame_id == 0 ? -1 : static_cast<int64_t>(frame_id),
+                    message, std::move(fields)});
+    } catch (...) {
+    }
   }
 
   static void stopOne(Pipeline& pipeline) noexcept {
@@ -438,10 +501,12 @@ class DualVioPipeline::Impl {
   Pipeline right_;
   bool initialized_ = false;
   std::string last_error_;
+  AsyncLogger* logger_ = nullptr;
 };
 
-DualVioPipeline::DualVioPipeline(int left_host, int right_host)
-    : impl_(std::make_unique<Impl>(left_host, right_host)) {}
+DualVioPipeline::DualVioPipeline(int left_host, int right_host,
+                                 AsyncLogger* logger)
+    : impl_(std::make_unique<Impl>(left_host, right_host, logger)) {}
 
 DualVioPipeline::~DualVioPipeline() = default;
 
