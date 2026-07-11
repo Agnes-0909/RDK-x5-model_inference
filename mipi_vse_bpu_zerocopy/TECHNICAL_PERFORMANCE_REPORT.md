@@ -2,11 +2,11 @@
 
 ## 1. 报告摘要
 
-本报告记录 `mipi_vse_bpu_zerocopy` 在 RDK X5 上的一次双路 100 帧工程基线。左右 SC132GS 图像分别经 MIPI host 0/2、VIN、ISP 和 VSE；VSE 将 `1088×1280 NV12` 输入的中心 `1088×1088` 区域缩放为 `640×640 NV12`。应用用 `hbSysRegisterMem` 注册 VSE 输出物理内存，交给两个独立模型实例和 worker；二者均绑定同一个 `bpu_core0`，随后在 CPU 上执行 YOLO11 后处理并归还 VSE 帧。
+本报告记录 `mipi_vse_bpu_zerocopy` 在 RDK X5 上的一次双路 100 帧工程基线。左右 SC132GS 图像分别经 MIPI host 0/2、VIN、ISP 和 VSE；VSE 将 `1088×1280 NV12` 输入的中心 `1088×1088` 区域缩放为 `640×640 NV12`。应用用 `hbSysRegisterMem` 注册 VSE 输出物理内存，交给两个独立模型实例和 worker（每路独立处理线程）；二者均绑定同一个 `bpu_core0`（BPU 硬件执行核心 0），随后在 CPU 上执行 YOLO11 后处理（postprocess，即输出扫描、解码、坐标映射和 NMS）并归还 VSE 帧。
 
-实测事实如下：左右各成功处理 100 帧，失败、超时、释放错误和物理地址不一致均为 0；200/200 次推理满足 `vse_phy == dnn_phy`，每路注册缓存为 3 miss/97 hit。左右 worker 端到端均值分别为 63.424318 ms 和 63.116270 ms，其中 BPU 均值分别为 59.964744 ms 和 59.598659 ms，后处理均值分别为 3.318520 ms 和 3.376071 ms。
+实测事实如下：左右各成功处理 100 帧，失败、超时、释放错误和物理地址不一致均为 0；200/200 次推理满足 `vse_phy == dnn_phy`，每路注册缓存为 3 miss/97 hit。左右 worker 端到端均值分别为 63.424 ms 和 63.116 ms，其中 BPU 均值分别为 59.965 ms 和 59.599 ms，后处理均值分别为 3.319 ms 和 3.376 ms。
 
-吞吐有两种口径：验收窗口口径为 31.708932 aggregate FPS、15.854466 paired FPS；按完成间隔计算的稳态口径为 **31.550388 aggregate FPS、15.778467 paired FPS**。瓶颈判断优先使用后者，因为首末完成时刻之间只有 `N-1` 个完成间隔。结合 BPU 内部计时，`wait_ms` 占总耗时的绝大部分，单 core BPU 调度/执行是当前主要瓶颈。双 worker 没有使 BPU 算力翻倍，其价值是隔离两路生命周期与背压，并允许一侧 CPU 后处理同另一侧任务调度/执行发生重叠。
+FPS 指每秒完成帧数；aggregate FPS 是左右路合计完成速率，pair 是按完成顺序将第 k 个左/右结果配成一对，paired FPS 是每秒完成的 pair 数。窗口计数口径为 31.708932 aggregate FPS、15.854466 paired FPS；更严格按 `N-1` 个完成间隔计算的**首末完成区间速率**为 31.550388 aggregate FPS、15.778467 paired FPS。后者排除了首个完成前的启动时间，但没有剔除预热、检查滚动稳定性或覆盖多次运行，不能称为或证明稳态性能。结合 BPU 内部计时，`wait_ms` 占总耗时的绝大部分，单 core BPU 调度/执行是当前主要瓶颈。双 worker 没有使 BPU 算力翻倍，其价值是隔离两路生命周期与背压，并允许一侧 CPU 后处理同另一侧任务调度/执行发生重叠。
 
 ## 2. 测试对象与环境
 
@@ -30,14 +30,14 @@
 ## 3. 系统链路与并发架构
 
 ```text
-左 SC132GS -> MIPI0 -> VIN -> ISP -> VSE 640x640 NV12 -> VseFrame -> [容量 1 队列]
-                                                                  -> 左 worker -> hbSysRegisterMem/cache -> 左模型 --+
-                                                                                                             |
-                                                                                                      同一 bpu_core0
-                                                                                                             |
-右 SC132GS -> MIPI2 -> VIN -> ISP -> VSE 640x640 NV12 -> VseFrame -> [容量 1 队列]                            |
-                                                                  -> 右 worker -> hbSysRegisterMem/cache -> 右模型 --+
-                                                                                  -> CPU 后处理 -> release
+左 SC132GS -> MIPI0 -> VIN -> ISP -> VSE 640x640 NV12 -> [容量 1] -> 左 worker -> register/cache -> 左模型 --+
+                                                                                                            |
+                                                                                                     共享 bpu_core0
+                                                                                                            |
+右 SC132GS -> MIPI2 -> VIN -> ISP -> VSE 640x640 NV12 -> [容量 1] -> 右 worker -> register/cache -> 右模型 --+
+
+BPU 完成 -> 左 worker -> 左 CPU 后处理 -> 左 VseFrame release
+BPU 完成 -> 右 worker -> 右 CPU 后处理 -> 右 VseFrame release
 ```
 
 每路 VSE 配置 3 个连续缓冲区。主线程先后取得左右帧，再通过 move-only 的 `VseFrame` 将所有权移入对应的容量 1 队列。队列只有一个 `optional<VseFrame>` 槽位：worker 未取走上一帧时，生产者在 `push` 阻塞，从而把处理能力不足反向传播到取帧侧，限制在途帧和延迟积累；关闭队列会唤醒生产者和消费者。100 帧运行中累计 push 等待只有左 0.068 ms、右 0.036 ms，说明该次运行未出现显著的生产者阻塞，但容量 1 的背压约束仍然成立。
@@ -81,41 +81,50 @@
 
 ## 6. 测试方法与数据口径
 
-主测试从 `events.jsonl` 按 `channel` 收集 100 条 `dnn.inference_complete` 和 100 条 `worker.frame_processed`。分位数在升序数组位置 `(n-1)×p` 上做线性插值，分别取 P50/P90/P95/P99；这一定义用于避免不同统计工具默认算法不一致。计算均值同 `summary.json` 逐路交叉检查，绝对差均小于 0.001 ms。
+主测试从 `events.jsonl` 按 `channel` 收集 100 条 `dnn.inference_complete` 和 100 条 `worker.frame_processed`。分位数在升序数组位置 `(n-1)×p` 上做线性插值，分别取 P50/P90/P95/P99；这一定义用于避免不同统计工具默认算法不一致。计算均值同 `summary.json` 逐路交叉检查，绝对差均小于 0.001 ms。正文耗时统一显示到 0.001 ms，完整精度保留在已校验 JSON 中。
+
+每路只有 100 个样本时，线性插值 P99 的位置为 98.01，几乎完全由最慢 1–2 个样本决定。因此本报告的 P99 仅为探索性统计，不用于性能认证或优化验收。约 100 帧的基线应主要观察 P90、P95、max 及相应原始慢样本；若要把 P95/P99 作为验收指标，应每路每次至少采集 1000 帧、重复多次运行，并报告跨运行离散度或置信区间。
 
 吞吐口径如下：
 
 | 口径 | 公式 | 时间窗 | 结果 |
 |---|---|---:|---:|
 | window aggregate | 200 个完成帧 / 首个至末个 `worker.frame_processed` | 6.307371 s | 31.708932 FPS |
-| window paired | 100 个名义帧对 / 同一首末 worker 完成窗 | 6.307371 s | 15.854466 FPS |
-| steady intercompletion | 199 个 aggregate 完成间隔 / 首末 worker 完成窗 | 6.307371 s | **31.550388 FPS** |
-| steady paired | 左右各自按完成时间排序，第 k 个左右结果取较晚时刻作为 pair 完成；99 个 pair 间隔 / 首末 pair 完成窗 | 6.274374 s | **15.778467 FPS** |
+| window paired | 100 个名义 pair / 同一首末 worker 完成窗 | 6.307371 s | 15.854466 FPS |
+| intercompletion interval rate（aggregate） | 199 个 aggregate 完成间隔 / 首末 worker 完成窗 | 6.307371 s | **31.550388 FPS** |
+| intercompletion interval rate（pair） | 左右各自按完成时间排序，第 k 个左右结果取较晚时刻作为 pair 完成；99 个 pair 间隔 / 首末 pair 完成窗 | 6.274374 s | **15.778467 FPS** |
 
-window 指标保留为验收口径，但首末两个完成事件之间实际只有 `N-1` 个间隔，使用 `N/span` 会略高估稳态速率。因此稳态描述和瓶颈判断优先采用 31.550388 aggregate FPS 与 15.778467 paired FPS。以上是完成端吞吐，不是传感器曝光帧率或单帧完整链路延迟。
+window 指标保留为原验收窗口口径，但首末两个完成事件之间实际只有 `N-1` 个间隔，使用 `N/span` 会高估该区间内的完成间隔速率。因此瓶颈讨论引用 31.550388 aggregate FPS 与 15.778467 paired FPS 作为**本次首末完成区间速率**。该口径排除了首个完成前的启动时间，却没有预热剔除、滚动窗口稳定性检查或多次运行，不能证明稳态。已校验 JSON 沿用历史键名 `steady_intercompletion_fps`/`steady_paired_fps`，其正确语义以本段为准。以上均为完成端速率，不是传感器曝光帧率或单帧完整链路延迟。
 
 ## 7. 100 帧性能结果
 
-下表所有耗时单位为 ms，数值直接来自已校验 JSON；`total_ms` 与 `bpu_ms` 是同一边界在不同事件中的记录。
+下表所有耗时单位为 ms，正文按 3 位小数显示，数值由已校验 JSON 四舍五入而来。DNN `total_ms` 与 worker `bpu_ms` 是同一批推理、同一计时边界的直接映射，不是两组独立样本；为保留两个日志字段的可追溯性，分别列在 DNN 分阶段表和 worker 表中，分析时不得重复计数。
+
+DNN 分阶段：
 
 | 路 | 指标 | count | min | mean | P50 | P90 | P95 | P99 | max |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 左 | `total_ms` | 100 | 46.663600 | 59.964744 | 60.135100 | 61.784530 | 66.377345 | 68.708184 | 71.102400 |
-| 左 | `submit_ms` | 100 | 0.043834 | 0.058125 | 0.053875 | 0.062808 | 0.078919 | 0.141002 | 0.269125 |
-| 左 | `wait_ms` | 100 | 46.247200 | 59.558218 | 59.728150 | 61.418630 | 66.018285 | 68.351489 | 70.657100 |
-| 左 | `invalidate_ms` | 100 | 0.285083 | 0.326230 | 0.308312 | 0.339341 | 0.406117 | 0.818391 | 1.129580 |
-| 左 | `release_ms` | 100 | 0.014542 | 0.021032 | 0.019958 | 0.026046 | 0.028890 | 0.033215 | 0.038042 |
-| 左 | `bpu_ms` | 100 | 46.663600 | 59.964744 | 60.135100 | 61.784530 | 66.377345 | 68.708184 | 71.102400 |
-| 左 | `postprocess_ms` | 100 | 2.953950 | 3.318520 | 3.036370 | 3.294116 | 3.362079 | 13.159057 | 15.659500 |
-| 左 | `end_to_end_ms` | 100 | 50.067800 | 63.424318 | 63.333050 | 66.609240 | 70.067025 | 74.630217 | 77.255400 |
-| 右 | `total_ms` | 100 | 38.001900 | 59.598659 | 60.232550 | 61.671400 | 63.803310 | 68.008104 | 68.919300 |
-| 右 | `submit_ms` | 100 | 0.046708 | 0.056551 | 0.052250 | 0.061862 | 0.078286 | 0.142593 | 0.143583 |
-| 右 | `wait_ms` | 100 | 37.527000 | 59.181914 | 59.821800 | 61.307530 | 63.442200 | 67.629851 | 68.565500 |
-| 右 | `invalidate_ms` | 100 | 0.283291 | 0.337180 | 0.311083 | 0.321762 | 0.352962 | 1.227358 | 1.242040 |
-| 右 | `release_ms` | 100 | 0.015167 | 0.022342 | 0.020834 | 0.027100 | 0.030666 | 0.037300 | 0.038167 |
-| 右 | `bpu_ms` | 100 | 38.001900 | 59.598659 | 60.232550 | 61.671400 | 63.803310 | 68.008104 | 68.919300 |
-| 右 | `postprocess_ms` | 100 | 2.957950 | 3.376071 | 3.008225 | 3.071424 | 3.134709 | 14.659402 | 14.689300 |
-| 右 | `end_to_end_ms` | 100 | 41.590100 | 63.116270 | 63.364300 | 65.692540 | 69.322225 | 75.908935 | 75.942100 |
+| 左 | `total_ms` | 100 | 46.664 | 59.965 | 60.135 | 61.785 | 66.377 | 68.708 | 71.102 |
+| 左 | `submit_ms` | 100 | 0.044 | 0.058 | 0.054 | 0.063 | 0.079 | 0.141 | 0.269 |
+| 左 | `wait_ms` | 100 | 46.247 | 59.558 | 59.728 | 61.419 | 66.018 | 68.351 | 70.657 |
+| 左 | `invalidate_ms` | 100 | 0.285 | 0.326 | 0.308 | 0.339 | 0.406 | 0.818 | 1.130 |
+| 左 | `release_ms` | 100 | 0.015 | 0.021 | 0.020 | 0.026 | 0.029 | 0.033 | 0.038 |
+| 右 | `total_ms` | 100 | 38.002 | 59.599 | 60.233 | 61.671 | 63.803 | 68.008 | 68.919 |
+| 右 | `submit_ms` | 100 | 0.047 | 0.057 | 0.052 | 0.062 | 0.078 | 0.143 | 0.144 |
+| 右 | `wait_ms` | 100 | 37.527 | 59.182 | 59.822 | 61.308 | 63.442 | 67.630 | 68.566 |
+| 右 | `invalidate_ms` | 100 | 0.283 | 0.337 | 0.311 | 0.322 | 0.353 | 1.227 | 1.242 |
+| 右 | `release_ms` | 100 | 0.015 | 0.022 | 0.021 | 0.027 | 0.031 | 0.037 | 0.038 |
+
+Worker 汇总（其中 `bpu_ms` 直接映射上述 `total_ms`）：
+
+| 路 | 指标 | count | min | mean | P50 | P90 | P95 | P99 | max |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 左 | `bpu_ms` | 100 | 46.664 | 59.965 | 60.135 | 61.785 | 66.377 | 68.708 | 71.102 |
+| 左 | `postprocess_ms` | 100 | 2.954 | 3.319 | 3.036 | 3.294 | 3.362 | 13.159 | 15.660 |
+| 左 | `end_to_end_ms` | 100 | 50.068 | 63.424 | 63.333 | 66.609 | 70.067 | 74.630 | 77.255 |
+| 右 | `bpu_ms` | 100 | 38.002 | 59.599 | 60.233 | 61.671 | 63.803 | 68.008 | 68.919 |
+| 右 | `postprocess_ms` | 100 | 2.958 | 3.376 | 3.008 | 3.071 | 3.135 | 14.659 | 14.689 |
+| 右 | `end_to_end_ms` | 100 | 41.590 | 63.116 | 63.364 | 65.693 | 69.322 | 75.909 | 75.942 |
 
 运行完整性、队列和缓存统计如下；queue wait 是 100 帧期间累计值，不是逐帧均值。
 
@@ -145,38 +154,38 @@ window 指标保留为验收口径，但首末两个完成事件之间实际只�
 
 ## 8. 后处理耗时构成
 
-本节只使用 `run_20260711_221544` 的 debug 事件，每路仅 2 个样本。JSON 明确记录 `percentiles_robust=false`，低于建议的 30 个样本，因此这里展示每个实际值和算术均值，仅用于解释处理阶段；不报告或引用其分位数，也不将其外推为稳定性能结论。
+本节只使用 `run_20260711_221544` 的 debug 事件，每路仅 2 个样本。JSON 明确记录 `percentiles_robust=false`。这里展示每个实际值和算术均值，仅用于解释处理阶段；不报告或引用其分位数，也不外推为稳定性能结论。后续取得每路至少 30 个 debug 样本，也只能用于阶段构成和均值的初步观察；若要验收 P95/P99，仍应采用每路每次至少 1000 帧并重复多次运行的主测试口径。
 
 | 路 | 阶段 | 样本 1 | 样本 2 | 均值 |
 |---|---|---:|---:|---:|
-| 左 | class scan ms | 2.975660 | 5.774110 | 4.374885 |
-| 左 | DFL decode ms | 0.029958 | 0.045125 | 0.037541 |
-| 左 | map ms | 0.001542 | 0.001542 | 0.001542 |
-| 左 | NMS ms | 0.005500 | 0.009584 | 0.007542 |
-| 左 | total ms | 3.054080 | 5.845650 | 4.449865 |
-| 右 | class scan ms | 2.940450 | 2.958830 | 2.949640 |
-| 右 | DFL decode ms | 0.070500 | 0.031750 | 0.051125 |
-| 右 | map ms | 0.001750 | 0.001333 | 0.001541 |
-| 右 | NMS ms | 0.007333 | 0.006042 | 0.006687 |
-| 右 | total ms | 3.025530 | 3.001280 | 3.013405 |
+| 左 | class scan ms | 2.976 | 5.774 | 4.375 |
+| 左 | DFL decode ms | 0.030 | 0.045 | 0.038 |
+| 左 | map ms | 0.002 | 0.002 | 0.002 |
+| 左 | NMS ms | 0.006 | 0.010 | 0.008 |
+| 左 | total ms | 3.054 | 5.846 | 4.450 |
+| 右 | class scan ms | 2.940 | 2.959 | 2.950 |
+| 右 | DFL decode ms | 0.071 | 0.032 | 0.051 |
+| 右 | map ms | 0.002 | 0.001 | 0.002 |
+| 右 | NMS ms | 0.007 | 0.006 | 0.007 |
+| 右 | total ms | 3.026 | 3.001 | 3.013 |
 
 | 路 | proposals（样本 1 / 2 / 均值） | detections（样本 1 / 2 / 均值） |
 |---|---:|---:|
-| 左 | 10 / 11 / 10.5 | 1 / 2 / 1.5 |
-| 右 | 10 / 10 / 10.0 | 1 / 1 / 1.0 |
+| 左 | 10 / 11 / 10.500 | 1 / 2 / 1.500 |
+| 右 | 10 / 10 / 10.000 | 1 / 1 / 1.000 |
 
-这 4 帧中 class scan 是后处理总耗时的主要组成，DFL、map 和 NMS 较小；这是对代码阶段和样本机制的直接观察。左路第二个样本 class scan 较高，但样本数不足，不能据此断言通道固有差异或稳定尾延迟成因。
+这 4 帧中 class scan 是后处理总耗时的主要组成，DFL、map 和 NMS 较小；这是对代码阶段和样本机制的直接观察。左路第二个样本 class scan 较高，但样本数不足，不能据此断言通道固有差异或尾延迟成因。
 
 ## 9. 性能瓶颈分析
 
 以下明确区分事实与推断。
 
-- **测量事实：** 左右 BPU `wait_ms` 均值为 59.558218/59.181914 ms，而 BPU total 均值为 59.964744/59.598659 ms；submit、invalidate、release 的均值总和仅约 0.405/0.416 ms。故总 BPU timer 由 wait 主导。
-- **工程推断：** 两路任务都提交到唯一的 `bpu_core0`，`wait_ms` 同时覆盖 runtime 排队和 BPU 执行，日志不能把二者分离。结合单 core 约束和稳态 15.778467 pair FPS，当前吞吐瓶颈应定位在单 core 的调度/执行阶段，但不能仅凭现有埋点量化“排队”与“纯计算”的比例。
+- **测量事实：** 左右 BPU `wait_ms` 均值为 59.558/59.182 ms，而 BPU total 均值为 59.965/59.599 ms；submit、invalidate、release 的均值总和仅约 0.405/0.416 ms。故总 BPU timer 由 wait 主导。
+- **工程推断：** 两路任务都提交到唯一的 `bpu_core0`，`wait_ms` 同时覆盖 runtime 排队和 BPU 执行，日志不能把二者分离。结合单 core 约束和本次首末完成区间 15.778467 pair FPS，当前吞吐瓶颈应定位在单 core 的调度/执行阶段，但不能仅凭现有埋点量化“排队”与“纯计算”的比例；该速率也不构成稳态证明。
 - **并发解释：** 双模型/双 worker 不会让单 core 算力翻倍。它能隔离每路注册缓存、task 和帧所有权，并让一侧约 3.3 ms 的 CPU 后处理与另一侧的 BPU 任务调度/执行重叠，因此 aggregate 完成流可接近 paired 流的两倍。
-- **后处理事实：** 100 帧 info 运行中，左右后处理均值为 3.318520/3.376071 ms，约为 worker 端到端均值的 5%；平均瓶颈不是 CPU 后处理。不过左路 postprocess P99/max 为 13.159057/15.659500 ms，右路为 14.659402/14.689300 ms，存在少量尾部抬升，值得增加样本和系统指标后定位。
-- **通道比较：** 左右均值和 P50 很接近；左路 BPU P95 较高（66.377345 vs 63.803310 ms），右路 worker 端到端 P99 较高（75.908935 vs 74.630217 ms）。这表明尾延迟形态不同，但单次各 100 帧不足以归因于传感器、线程调度或热状态。
-- **背压事实：** push 累计等待不足 0.1 ms/路，未显示队列饱和是本次瓶颈；容量 1 主要承担延迟上界与资源所有权保护，不能从低等待值推断可以无限增大队列。
+- **后处理事实：** 100 帧 info 运行中，左右后处理均值为 3.319/3.376 ms，约为 worker 端到端均值的 5%；平均瓶颈不是 CPU 后处理。左路 postprocess P99/max 为 13.159/15.660 ms，右路为 14.659/14.689 ms；其中 P99 受最慢 1–2 个样本主导，只能提示检查原始慢样本，不能作为尾延迟认证或优化验收结论。
+- **通道比较：** 左右均值和 P50 很接近；左路 BPU P95 较高（66.377 vs 63.803 ms），右路 worker 端到端 P99 较高（75.909 vs 74.630 ms）。这些是探索性差异，单次各 100 帧不足以归因于传感器、线程调度或热状态。
+- **背压事实：** push 累计等待不足 0.100 ms/路，未显示队列饱和是本次瓶颈；容量 1 主要承担延迟上界与资源所有权保护，不能从低等待值推断可以无限增大队列。
 
 ## 10. 优化建议
 
@@ -184,18 +193,26 @@ window 指标保留为验收口径，但首末两个完成事件之间实际只�
 
 | 优先级 | 建议 | 原因 | 预期验证指标 |
 |---|---|---|---|
-| P0 | 先建立可重复基线：相同模式至少多次运行，并加入 ≥30 帧 debug 分段或低开销阶段采样；同时记录 BPU/CPU 频率、温度和功耗模式 | 当前只有一次 100 帧和每路 2 个 debug 样本 | steady aggregate/paired FPS 的多次均值与离散度；BPU wait、post 和 end-to-end 的 P95/P99；无错误、无地址 mismatch |
-| P1 | 优先评估模型与 BPU runtime 路径：在精度约束下比较更轻模型/编译配置；若 SDK 提供排队与执行拆分埋点则启用 | wait 约占 BPU total 的 99%，收益空间主要在此 | `wait_ms` mean/P95 下降，steady paired FPS 上升；检测精度不低于业务阈值；core/address 校验仍通过 |
-| P2 | 针对 CPU 后处理尾部做 profiling，检查 class scan 的数据依赖、临时分配和调度抖动，再决定是否复用缓冲或向量化 | 平均约 3.3 ms，不是首要瓶颈，但 P99/max 有 13–16 ms 尾部 | postprocess mean 不回退，P99/max 收敛；BPU wait 与检测结果不变 |
+| P0 | 先建立可重复基线：相同模式多次运行，每路每次至少 1000 帧；另采集每路至少 30 帧 debug 分段；同时记录 BPU/CPU 频率、温度和功耗模式 | 当前只有一次 100 帧和每路 2 个 debug 样本 | 首末完成区间 aggregate/pair rate 的跨运行均值与离散度；延迟 P95/P99 的跨运行离散度或置信区间；debug 只初步观察阶段构成/均值；无错误、无地址 mismatch |
+| P1 | 优先评估模型与 BPU runtime 路径：在精度约束下比较更轻模型/编译配置；若 SDK 提供排队与执行拆分埋点则启用 | wait 约占 BPU total 的 99%，收益空间主要在此 | 在上述 ≥1000 帧、多次运行口径下，`wait_ms` mean/P95 下降，pair intercompletion interval rate 上升；检测精度不低于业务阈值；core/address 校验仍通过 |
+| P2 | 针对 CPU 后处理尾部做 profiling，检查 class scan 的数据依赖、临时分配和调度抖动，再决定是否复用缓冲或向量化 | 平均约 3.3 ms，不是首要瓶颈；当前 100 帧 P99 仅提供慢样本线索 | 先复核 P90/P95/max 对应原始样本；正式验收使用每路每次 ≥1000 帧的 postprocess mean/P95/P99，并报告多次运行离散度 |
 | P3 | 增加曝光/采集、VSE 完成、入队、出队、输出就绪时间戳，并单独计量 VSE release | 现有 `end_to_end` 不是相机到结果全链路 | 可报告 exposure-to-output、VIO、queue 和 release 的独立分布，并保证日志开销经 A/B 验证可接受 |
-| P4 | 保持容量 1 为默认；只有在证实 BPU 空洞由供帧抖动造成时，才 A/B 测试更深队列或调度策略 | 本次 push wait 极小，盲目扩容更可能增加陈旧帧延迟 | steady FPS 改善且完整链路 P95 不恶化；内存/在途帧上限明确；release/error 仍为 0 |
+| P4 | 保持容量 1 为默认；只有在证实 BPU 空洞由供帧抖动造成时，才 A/B 测试更深队列或调度策略 | 本次 push wait 极小，盲目扩容更可能增加陈旧帧延迟 | 多次运行的 intercompletion interval rate 改善且完整链路 P95 不恶化；内存/在途帧上限明确；release/error 仍为 0 |
 
 ## 11. 复现与诊断命令
 
-在仓库挂载到 Docker `/project` 时构建：
+前置条件：Docker 构建容器已运行且仓库挂载到 `/project`；X5 可通过 root SSH 访问且未被其他 VIO 应用占用；模型已部署到板端；宿主机具备 `ssh`、`scp` 和 Python 3。下面 jq 诊断块还要求板端安装 `jq`；没有 jq 时可复制日志并使用随后给出的纯 Python 替代。以下命令应在同一个宿主 shell 中执行，先设置环境变量：
 
 ```bash
-docker exec 3c543521b4ca bash -lc \
+export CONTAINER="${CONTAINER:-3c543521b4ca}"
+export BOARD_IP="${BOARD_IP:-192.168.1.12}"
+export MODEL="${MODEL:-/root/mipi_proj/model/model.bin}"
+```
+
+构建：
+
+```bash
+docker exec "$CONTAINER" bash -lc \
   'cd /project/mipi_vse_bpu_zerocopy && ./build.sh'
 ```
 
@@ -203,17 +220,17 @@ docker exec 3c543521b4ca bash -lc \
 
 ```bash
 cd mipi_vse_bpu_zerocopy
-ssh root@192.168.1.12 'mkdir -p /root/mipi_vse_bpu_zerocopy'
+ssh root@"$BOARD_IP" 'mkdir -p /root/mipi_vse_bpu_zerocopy'
 scp build_aarch64/mipi_vse_bpu_zerocopy scripts/run_on_board.sh \
-  root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/
-ssh root@192.168.1.12 \
-  'cd /root/mipi_vse_bpu_zerocopy && FRAMES=100 LOG_LEVEL=info ./run_on_board.sh'
+  root@"$BOARD_IP":/root/mipi_vse_bpu_zerocopy/
+ssh root@"$BOARD_IP" \
+  "cd /root/mipi_vse_bpu_zerocopy && MODEL='$MODEL' FRAMES=100 LOG_LEVEL=info ./run_on_board.sh"
 ```
 
-查看最新 summary、地址/core 和事件计数：
+若板端已安装 jq，可查看最新 summary、地址/core 和事件计数：
 
 ```bash
-ssh root@192.168.1.12 <<'SH'
+ssh root@"$BOARD_IP" 'bash -s' <<'SH'
 cd /root/mipi_vse_bpu_zerocopy
 RUN_DIR="$(find logs -maxdepth 1 -type d -name 'run_*' | sort | tail -1)"
 jq . "$RUN_DIR/summary.json"
@@ -233,14 +250,15 @@ SH
 
 ```bash
 mkdir -p /tmp/mipi_vse_report_data/run_100
-scp root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221831/{events.jsonl,summary.json,run.log} \
+scp root@"$BOARD_IP":/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221831/{events.jsonl,summary.json,run.log} \
   /tmp/mipi_vse_report_data/run_100/
 python3 - <<'PY'
 import json, math
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 path = '/tmp/mipi_vse_report_data/run_100/events.jsonl'
 events = [json.loads(line) for line in open(path)]
+summary = json.load(open('/tmp/mipi_vse_report_data/run_100/summary.json'))
 
 def percentile(values, p):
     values = sorted(values)
@@ -264,32 +282,38 @@ for event in events:
         metrics[event['channel']][name].append(event['fields'][name])
 for channel in ('left','right'):
     print(channel, json.dumps({k:describe(v) for k,v in metrics[channel].items()}, indent=2))
+dnn = [e for e in events if (e['component'],e['event']) == ('dnn','inference_complete')]
+print('summary', json.dumps(summary, indent=2))
+print('address_matches', sum(e['fields']['vse_phy'] == e['fields']['dnn_phy'] for e in dnn), '/', len(dnn))
+print('core_errors', sum(e['fields']['bpu_core_index'] != 0 or e['fields']['bpu_core_mask'] != 1 for e in dnn))
+print('event_counts', Counter((e['component'],e['event']) for e in events))
 PY
 ```
 
 静态零拷贝门禁可在构建容器中直接执行。`build.sh` 生成的是 AArch64 测试程序，不能在 x86 构建容器中直接运行，应复制到 X5 执行：
 
 ```bash
-docker exec 3c543521b4ca bash -lc '
+docker exec "$CONTAINER" bash -lc '
   cd /project/mipi_vse_bpu_zerocopy
   cmake -DPROJECT_SOURCE_DIR="$PWD" -P test/check_no_image_copy.cmake
   ./build.sh
 '
 cd mipi_vse_bpu_zerocopy
-ssh root@192.168.1.12 'rm -rf /tmp/mipi_zerocopy_tests && mkdir -p /tmp/mipi_zerocopy_tests'
-scp build_aarch64/test_* root@192.168.1.12:/tmp/mipi_zerocopy_tests/
-ssh root@192.168.1.12 \
+ssh root@"$BOARD_IP" 'rm -rf /tmp/mipi_zerocopy_tests && mkdir -p /tmp/mipi_zerocopy_tests'
+scp build_aarch64/test_* root@"$BOARD_IP":/tmp/mipi_zerocopy_tests/
+ssh root@"$BOARD_IP" \
   'set -e; for test in /tmp/mipi_zerocopy_tests/test_*; do echo "RUN $test"; "$test"; done'
 ```
 
 ## 12. 结论与限制
 
-本次测量直接证明：应用在 200 次成功推理中保持 VSE 与 DNN 输入物理地址一致，两路注册缓存行为与各 3 个 VSE buffer 相符，双 worker/双模型都稳定提交到 `bpu_core0`，运行无 timeout、处理失败或释放错误。按更严谨的稳态完成间隔，双路总吞吐为 31.550388 FPS、成对结果吞吐为 15.778467 FPS。BPU wait 主导约 60 ms 的 BPU total，CPU 后处理平均约 3.3 ms；因此首要优化对象是单 core 的模型执行/调度路径，而不是扩大队列或优先微调平均后处理。
+本次测量直接证明：应用在 200 次成功推理中保持 VSE 与 DNN 输入物理地址一致，两路注册缓存行为与各 3 个 VSE buffer 相符，双 worker/双模型均提交到 `bpu_core0`，运行无 timeout、处理失败或释放错误。本次首末完成区间速率为 31.550388 aggregate FPS、15.778467 paired FPS；它不是稳态证明。BPU wait 主导约 60 ms 的 BPU total，CPU 后处理平均约 3.3 ms；因此首要优化对象是单 core 的模型执行/调度路径，而不是扩大队列或优先微调平均后处理。
 
 结论适用范围受以下限制约束：
 
-- 只有单次、每路 100 帧的 info 基线，不代表长稳、老化或不同负载下的完整性能认证。
-- 后处理阶段只有每路 2 个 debug 样本，`percentiles_robust=false`，仅能解释机制，不能形成稳定分位数结论。
+- 只有单次、每路 100 帧的 info 基线；首末完成区间速率虽排除首个完成前启动时间，但没有预热剔除、滚动稳定性检查或多次运行，不代表稳态、长稳、老化或不同负载下的完整性能认证。
+- 100 帧 P99 几乎由最慢 1–2 个样本决定，仅供探索，不作为性能认证或优化验收；P95/P99 验收应采用每路每次至少 1000 帧、多次运行并报告跨运行离散度或置信区间。
+- 后处理阶段只有每路 2 个 debug 样本，`percentiles_robust=false`，仅能解释机制；即使扩展到每路至少 30 个 debug 样本，也只用于阶段构成和均值的初步观察。
 - `worker.end_to_end_ms` 从 worker 出队后开始，不包含曝光到 VSE 输出、主线程取帧和排队，也不包含 VSE frame release；它包含 processor 内同步日志入队开销，但排除异步 writer 的序列化/文件 I/O 和随后提交的 `worker.frame_processed` 事件。当前没有曝光到检测输出的真正全链路时间。
 - 未记录 BPU/CPU/DDR 频率、温度、功耗模式和功耗数据，不能判断热降频、能效或功耗上限。
 - `wait_ms` 合并了 BPU runtime 排队与执行，现有日志无法量化二者各自占比。
