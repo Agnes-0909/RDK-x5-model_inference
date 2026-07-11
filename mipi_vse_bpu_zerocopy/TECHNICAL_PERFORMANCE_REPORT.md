@@ -246,18 +246,21 @@ jq -s 'group_by(.component+"."+.event)
 SH
 ```
 
-复制原始数据并用与本报告相同的线性插值方法统计延迟：
+复制两个运行的原始数据，并用 Python 3 标准库复算延迟、吞吐、地址/core/cache 和 debug 后处理分段：
 
 ```bash
-mkdir -p /tmp/mipi_vse_report_data/run_100
+mkdir -p /tmp/mipi_vse_report_data/run_100 /tmp/mipi_vse_report_data/run_debug
 scp root@"$BOARD_IP":/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221831/{events.jsonl,summary.json,run.log} \
   /tmp/mipi_vse_report_data/run_100/
+scp root@"$BOARD_IP":/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221544/events.jsonl \
+  /tmp/mipi_vse_report_data/run_debug/events.jsonl
 python3 - <<'PY'
 import json, math
 from collections import Counter, defaultdict
 
-path = '/tmp/mipi_vse_report_data/run_100/events.jsonl'
-events = [json.loads(line) for line in open(path)]
+root = '/tmp/mipi_vse_report_data'
+events = [json.loads(line) for line in open(f'{root}/run_100/events.jsonl')]
+debug_events = [json.loads(line) for line in open(f'{root}/run_debug/events.jsonl')]
 summary = json.load(open('/tmp/mipi_vse_report_data/run_100/summary.json'))
 
 def percentile(values, p):
@@ -282,11 +285,58 @@ for event in events:
         metrics[event['channel']][name].append(event['fields'][name])
 for channel in ('left','right'):
     print(channel, json.dumps({k:describe(v) for k,v in metrics[channel].items()}, indent=2))
+
+# 完成端吞吐。intercompletion 口径是首末完成区间速率，不代表稳态。
+processed = sorted(
+    (e for e in events if (e['component'],e['event']) == ('worker','frame_processed')),
+    key=lambda e: e['monotonic_us'])
+by_channel = {
+    channel: sorted((e for e in processed if e['channel'] == channel),
+                    key=lambda e: e['monotonic_us'])
+    for channel in ('left','right')}
+assert len(processed) == 200 and all(len(by_channel[c]) == 100 for c in by_channel)
+span_s = (processed[-1]['monotonic_us'] - processed[0]['monotonic_us']) / 1e6
+pairs = min(map(len, by_channel.values()))
+pair_completion_us = [
+    max(by_channel['left'][i]['monotonic_us'],
+        by_channel['right'][i]['monotonic_us'])
+    for i in range(pairs)]
+pair_span_s = (pair_completion_us[-1] - pair_completion_us[0]) / 1e6
+print('THROUGHPUT window_aggregate_fps=%.6f formula=%d/%.6f' %
+      (len(processed)/span_s, len(processed), span_s))
+print('THROUGHPUT window_paired_fps=%.6f formula=%d/%.6f' %
+      (pairs/span_s, pairs, span_s))
+print('THROUGHPUT intercompletion_aggregate_fps=%.6f formula=%d/%.6f' %
+      ((len(processed)-1)/span_s, len(processed)-1, span_s))
+print('THROUGHPUT intercompletion_pair_fps=%.6f formula=%d/%.6f' %
+      ((pairs-1)/pair_span_s, pairs-1, pair_span_s))
+
 dnn = [e for e in events if (e['component'],e['event']) == ('dnn','inference_complete')]
 print('summary', json.dumps(summary, indent=2))
 print('address_matches', sum(e['fields']['vse_phy'] == e['fields']['dnn_phy'] for e in dnn), '/', len(dnn))
 print('core_errors', sum(e['fields']['bpu_core_index'] != 0 or e['fields']['bpu_core_mask'] != 1 for e in dnn))
+for channel in ('left','right'):
+    item = summary[channel]
+    print('CACHE', channel, 'hits', item['cache_hits'], 'misses', item['cache_misses'],
+          'address_mismatches', item['address_mismatches'], 'failures', item['failures'],
+          'release_errors', item['release_errors'])
 print('event_counts', Counter((e['component'],e['event']) for e in events))
+
+# Debug 每路恰有 2 个 postprocess_complete 样本；逐样本和均值均输出。
+stage_names = ('class_scan_ms','dfl_decode_ms','map_ms','nms_ms','total_ms',
+               'proposals','detections')
+debug_post = [e for e in debug_events
+              if (e['component'],e['event']) == ('postprocess','postprocess_complete')]
+for channel in ('left','right'):
+    samples = [e['fields'] for e in debug_post if e['channel'] == channel]
+    assert len(samples) == 2
+    print('DEBUG_POSTPROCESS channel=%s samples=%d' % (channel, len(samples)))
+    for index, sample in enumerate(samples, 1):
+        print(' sample=%d %s' %
+              (index, ' '.join('%s=%s' % (name, sample[name]) for name in stage_names)))
+    print(' mean', ' '.join('%s=%.6f' %
+          (name, sum(sample[name] for sample in samples)/len(samples))
+          for name in stage_names))
 PY
 ```
 
