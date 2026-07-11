@@ -5,6 +5,13 @@
 
 namespace zerocopy {
 
+enum class LogLevel {
+  kDebug = 0,
+  kInfo = 1,
+  kWarn = 2,
+  kError = 3,
+};
+
 struct AppConfig {
   std::string model_path = "/root/mipi_proj/model/model.bin";
   int frames = 100;
@@ -15,6 +22,10 @@ struct AppConfig {
   int dnn_timeout_ms = 5000;
   float score_threshold = 0.25F;
   float nms_threshold = 0.45F;
+  std::string log_dir = "logs";
+  LogLevel log_level = LogLevel::kInfo;
+  int log_max_mb = 100;
+  int log_files = 5;
 };
 
 AppConfig defaultConfig();

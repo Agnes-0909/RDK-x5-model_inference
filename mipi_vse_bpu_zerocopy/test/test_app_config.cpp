@@ -42,6 +42,10 @@ int main() {
   CHECK(defaults.dnn_timeout_ms == 5000);
   CHECK(std::fabs(defaults.score_threshold - 0.25F) < 1e-6F);
   CHECK(std::fabs(defaults.nms_threshold - 0.45F) < 1e-6F);
+  CHECK(defaults.log_dir == "logs");
+  CHECK(defaults.log_level == zerocopy::LogLevel::kInfo);
+  CHECK(defaults.log_max_mb == 100);
+  CHECK(defaults.log_files == 5);
 
   char app[] = "app";
   char frames[] = "--frames";
@@ -52,6 +56,22 @@ int main() {
   const auto parsed = zerocopy::parseArgs(5, argv);
   CHECK(parsed.frames == 0);
   CHECK(std::fabs(parsed.score_threshold - 0.4F) < 1e-6F);
+
+  char log_dir_option[] = "--log-dir";
+  char log_dir[] = "/tmp/run";
+  char log_level_option[] = "--log-level";
+  char debug[] = "debug";
+  char log_max_option[] = "--log-max-mb";
+  char two[] = "2";
+  char log_files_option[] = "--log-files";
+  char three[] = "3";
+  char* log_argv[] = {app, log_dir_option, log_dir, log_level_option, debug,
+                      log_max_option, two, log_files_option, three};
+  const auto log_parsed = zerocopy::parseArgs(9, log_argv);
+  CHECK(log_parsed.log_dir == "/tmp/run");
+  CHECK(log_parsed.log_level == zerocopy::LogLevel::kDebug);
+  CHECK(log_parsed.log_max_mb == 2);
+  CHECK(log_parsed.log_files == 3);
 
   checkInvalid([] {
     char a[] = "app", f[] = "--frames", v[] = "-1";
@@ -74,6 +94,21 @@ int main() {
     char* args[] = {a, u};
     zerocopy::parseArgs(2, args);
   }, "unknown option");
+  checkInvalid([] {
+    char a[] = "app", l[] = "--log-level", v[] = "verbose";
+    char* args[] = {a, l, v};
+    zerocopy::parseArgs(3, args);
+  }, "log level");
+  checkInvalid([] {
+    char a[] = "app", m[] = "--log-max-mb", v[] = "0";
+    char* args[] = {a, m, v};
+    zerocopy::parseArgs(3, args);
+  }, "log");
+  checkInvalid([] {
+    char a[] = "app", f[] = "--log-files", v[] = "0";
+    char* args[] = {a, f, v};
+    zerocopy::parseArgs(3, args);
+  }, "log");
 
   if (failures != 0) {
     return 1;

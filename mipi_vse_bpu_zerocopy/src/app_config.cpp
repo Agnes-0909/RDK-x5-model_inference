@@ -38,6 +38,15 @@ float parseFloat(const std::string& option, const char* value) {
   return parsed;
 }
 
+LogLevel parseLogLevel(const char* value) {
+  const std::string level = value == nullptr ? "" : value;
+  if (level == "debug") return LogLevel::kDebug;
+  if (level == "info") return LogLevel::kInfo;
+  if (level == "warn") return LogLevel::kWarn;
+  if (level == "error") return LogLevel::kError;
+  throw std::invalid_argument("log level must be debug, info, warn, or error");
+}
+
 const char* requireValue(int argc, char** argv, int& index,
                          const std::string& option) {
   if (index + 1 >= argc) {
@@ -68,6 +77,12 @@ void validate(const AppConfig& config) {
   }
   if (!(config.nms_threshold > 0.0F && config.nms_threshold < 1.0F)) {
     throw std::invalid_argument("nms threshold must be between zero and one");
+  }
+  if (config.log_dir.empty()) {
+    throw std::invalid_argument("log directory must not be empty");
+  }
+  if (config.log_max_mb <= 0 || config.log_files <= 0) {
+    throw std::invalid_argument("log sizes and file count must be positive");
   }
 }
 
@@ -102,6 +117,16 @@ AppConfig parseArgs(int argc, char** argv) {
     } else if (option == "--nms") {
       config.nms_threshold =
           parseFloat(option, requireValue(argc, argv, i, option));
+    } else if (option == "--log-dir") {
+      config.log_dir = requireValue(argc, argv, i, option);
+    } else if (option == "--log-level") {
+      config.log_level = parseLogLevel(requireValue(argc, argv, i, option));
+    } else if (option == "--log-max-mb") {
+      config.log_max_mb =
+          parseInt(option, requireValue(argc, argv, i, option));
+    } else if (option == "--log-files") {
+      config.log_files =
+          parseInt(option, requireValue(argc, argv, i, option));
     } else if (option == "--help" || option == "-h") {
       throw std::invalid_argument("help requested");
     } else {
@@ -117,7 +142,9 @@ std::string usage(const char* program) {
   stream << "Usage: " << program
          << " [--model PATH] [--frames N] [--left-host N]"
             " [--right-host N] [--frame-timeout-ms N] [--max-timeouts N]"
-            " [--dnn-timeout-ms N] [--score F] [--nms F]";
+            " [--dnn-timeout-ms N] [--score F] [--nms F]"
+            " [--log-dir PATH] [--log-level debug|info|warn|error]"
+            " [--log-max-mb N] [--log-files N]";
   return stream.str();
 }
 
