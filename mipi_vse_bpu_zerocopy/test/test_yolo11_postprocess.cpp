@@ -47,8 +47,16 @@ int main() {
   }};
 
   zerocopy::Yolo11Postprocessor postprocessor(0.25F, 0.45F);
-  const auto detections = postprocessor.run(outputs);
+  zerocopy::PostprocessMetrics metrics;
+  const auto detections = postprocessor.run(outputs, &metrics);
   CHECK(detections.size() == 1);
+  CHECK(metrics.proposals == 2);
+  CHECK(metrics.detections == 1);
+  CHECK(metrics.class_scan_ms >= 0.0);
+  CHECK(metrics.dfl_decode_ms >= 0.0);
+  CHECK(metrics.map_ms >= 0.0);
+  CHECK(metrics.nms_ms >= 0.0);
+  CHECK(metrics.total_ms >= metrics.nms_ms);
   if (!detections.empty()) {
     const auto& d = detections.front();
     CHECK(d.class_id == 3);

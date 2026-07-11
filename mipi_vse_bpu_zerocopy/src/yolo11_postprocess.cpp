@@ -3,6 +3,7 @@
 #include "detection_mapper.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -13,6 +14,28 @@ namespace {
 constexpr int kClasses = 80;
 constexpr int kDflBins = 16;
 constexpr int kRegressionChannels = 4 * kDflBins;
+
+using Clock = std::chrono::steady_clock;
+
+double elapsedMs(const Clock::time_point& start,
+                 const Clock::time_point& end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+struct Candidate {
+  const FloatTensorView* classes = nullptr;
+  const FloatTensorView* regression = nullptr;
+  std::size_t cell = 0;
+  int stride = 0;
+  int class_id = 0;
+  float logit = 0.0F;
+};
+
+struct ModelProposal {
+  int class_id = 0;
+  float score = 0.0F;
+  Box box;
+};
 
 float sigmoid(float value) { return 1.0F / (1.0F + std::exp(-value)); }
 
@@ -52,41 +75,51 @@ Yolo11Postprocessor::Yolo11Postprocessor(float score_threshold,
 }
 
 std::vector<Detection> Yolo11Postprocessor::run(
-    const std::array<FloatTensorView, 6>& outputs) const {
+    const std::array<FloatTensorView, 6>& outputs,
+    PostprocessMetrics* metrics) const {
+  const auto total_start = Clock::now();
   const int sizes[3] = {80, 40, 20};
   const int strides[3] = {8, 16, 32};
-  std::vector<Detection> proposals;
   for (int scale = 0; scale < 3; ++scale) {
     const auto& classes = outputs[scale * 2];
     const auto& regression = outputs[scale * 2 + 1];
     validateView(classes, sizes[scale], kClasses, "classification");
     validateView(regression, sizes[scale], kRegressionChannels, "regression");
-    decodeScale(classes, regression, strides[scale], proposals);
   }
-  return nms(std::move(proposals));
-}
 
-void Yolo11Postprocessor::decodeScale(
-    const FloatTensorView& classes, const FloatTensorView& regression,
-    int stride, std::vector<Detection>& proposals) const {
   const float raw_threshold =
       std::log(score_threshold_ / (1.0F - score_threshold_));
-  const std::size_t cells =
-      static_cast<std::size_t>(classes.height) * classes.width;
-  for (std::size_t cell = 0; cell < cells; ++cell) {
-    const float* class_values = classes.data + cell * kClasses;
-    int best_class = 0;
-    float best_logit = class_values[0];
-    for (int class_id = 1; class_id < kClasses; ++class_id) {
-      if (class_values[class_id] > best_logit) {
-        best_logit = class_values[class_id];
-        best_class = class_id;
+  std::vector<Candidate> candidates;
+  const auto class_start = Clock::now();
+  for (int scale = 0; scale < 3; ++scale) {
+    const auto& classes = outputs[scale * 2];
+    const auto& regression = outputs[scale * 2 + 1];
+    const std::size_t cells =
+        static_cast<std::size_t>(classes.height) * classes.width;
+    for (std::size_t cell = 0; cell < cells; ++cell) {
+      const float* class_values = classes.data + cell * kClasses;
+      int best_class = 0;
+      float best_logit = class_values[0];
+      for (int class_id = 1; class_id < kClasses; ++class_id) {
+        if (class_values[class_id] > best_logit) {
+          best_logit = class_values[class_id];
+          best_class = class_id;
+        }
+      }
+      if (best_logit >= raw_threshold) {
+        candidates.push_back({&classes, &regression, cell, strides[scale],
+                              best_class, best_logit});
       }
     }
-    if (best_logit < raw_threshold) continue;
+  }
+  const auto class_end = Clock::now();
 
+  std::vector<ModelProposal> model_proposals;
+  model_proposals.reserve(candidates.size());
+  const auto dfl_start = Clock::now();
+  for (const auto& candidate : candidates) {
     const float* regression_values =
-        regression.data + cell * kRegressionChannels;
+        candidate.regression->data + candidate.cell * kRegressionChannels;
     float sides[4] = {};
     for (int side = 0; side < 4; ++side) {
       const float* values = regression_values + side * kDflBins;
@@ -104,18 +137,45 @@ void Yolo11Postprocessor::decodeScale(
       sides[side] = sum > 0.0F ? weighted / sum : 0.0F;
     }
 
-    const int grid_y = static_cast<int>(cell / classes.width);
-    const int grid_x = static_cast<int>(cell % classes.width);
-    const float center_x = (static_cast<float>(grid_x) + 0.5F) * stride;
-    const float center_y = (static_cast<float>(grid_y) + 0.5F) * stride;
-    Box model_box{center_x - sides[0] * stride,
-                  center_y - sides[1] * stride,
-                  center_x + sides[2] * stride,
-                  center_y + sides[3] * stride};
-    proposals.push_back(
-        Detection{best_class, sigmoid(best_logit),
-                  mapModelBoxToSensor(model_box)});
+    const int grid_y =
+        static_cast<int>(candidate.cell / candidate.classes->width);
+    const int grid_x =
+        static_cast<int>(candidate.cell % candidate.classes->width);
+    const float center_x =
+        (static_cast<float>(grid_x) + 0.5F) * candidate.stride;
+    const float center_y =
+        (static_cast<float>(grid_y) + 0.5F) * candidate.stride;
+    model_proposals.push_back(
+        {candidate.class_id, sigmoid(candidate.logit),
+         {center_x - sides[0] * candidate.stride,
+          center_y - sides[1] * candidate.stride,
+          center_x + sides[2] * candidate.stride,
+          center_y + sides[3] * candidate.stride}});
   }
+  const auto dfl_end = Clock::now();
+
+  std::vector<Detection> proposals;
+  proposals.reserve(model_proposals.size());
+  const auto map_start = Clock::now();
+  for (const auto& proposal : model_proposals) {
+    proposals.push_back({proposal.class_id, proposal.score,
+                         mapModelBoxToSensor(proposal.box)});
+  }
+  const auto map_end = Clock::now();
+
+  const auto nms_start = Clock::now();
+  auto detections = nms(std::move(proposals));
+  const auto nms_end = Clock::now();
+  if (metrics != nullptr) {
+    metrics->class_scan_ms = elapsedMs(class_start, class_end);
+    metrics->dfl_decode_ms = elapsedMs(dfl_start, dfl_end);
+    metrics->map_ms = elapsedMs(map_start, map_end);
+    metrics->nms_ms = elapsedMs(nms_start, nms_end);
+    metrics->total_ms = elapsedMs(total_start, nms_end);
+    metrics->proposals = candidates.size();
+    metrics->detections = detections.size();
+  }
+  return detections;
 }
 
 std::vector<Detection> Yolo11Postprocessor::nms(

@@ -40,6 +40,9 @@ class ZeroCopyYoloRunner::Impl {
   bool initialize() {
     if (initialized_) return true;
     if (config_.model_path.empty()) return fail("model path is empty");
+    if (config_.bpu_core_id != kX5BpuCore0) {
+      return fail("this X5 application supports only BPU core 0");
+    }
 
     const char* model_file = config_.model_path.c_str();
     int32_t ret = hbDNNInitializeFromFiles(&packed_, &model_file, 1);
@@ -124,17 +127,22 @@ class ZeroCopyYoloRunner::Impl {
 
     hbDNNInferCtrlParam control;
     HB_DNN_INITIALIZE_INFER_CTRL_PARAM(&control);
+    control.bpuCoreId = config_.bpu_core_id;
     hbDNNTaskHandle_t task = nullptr;
     hbDNNTensor* output_ptr = outputs_.data();
     const auto bpu_start = Clock::now();
+    const auto submit_start = bpu_start;
     int32_t ret = hbDNNInfer(&task, &output_ptr, &input, model_, &control);
+    const auto submit_end = Clock::now();
     if (ret != 0) return failCode("hbDNNInfer", ret);
+    const auto wait_start = Clock::now();
     ret = hbDNNWaitTaskDone(task, config_.timeout_ms);
-    const auto bpu_end = Clock::now();
+    const auto wait_end = Clock::now();
     if (ret != 0) {
       hbDNNReleaseTask(task);
       return failCode("hbDNNWaitTaskDone", ret);
     }
+    const auto invalidate_start = Clock::now();
     for (auto& output : outputs_) {
       ret = hbSysFlushMem(&output.sysMem[0], HB_SYS_MEM_CACHE_INVALIDATE);
       if (ret != 0) {
@@ -142,7 +150,10 @@ class ZeroCopyYoloRunner::Impl {
         return failCode("hbSysFlushMem(output invalidate)", ret);
       }
     }
+    const auto invalidate_end = Clock::now();
+    const auto release_start = Clock::now();
     ret = hbDNNReleaseTask(task);
+    const auto release_end = Clock::now();
     if (ret != 0) return failCode("hbDNNReleaseTask", ret);
 
     std::array<FloatTensorView, 6> views;
@@ -152,16 +163,20 @@ class ZeroCopyYoloRunner::Impl {
       views[i] = {static_cast<const float*>(outputs_[i].sysMem[0].virAddr),
                   size, size, channels};
     }
-    const auto post_start = Clock::now();
     try {
-      result.detections = postprocessor_.run(views);
+      result.detections = postprocessor_.run(views, &result.postprocess);
     } catch (const std::exception& error) {
       return fail(error.what());
     }
-    const auto post_end = Clock::now();
     result.dnn_input_phy = input.sysMem[0].phyAddr;
-    result.bpu_ms = elapsedMs(bpu_start, bpu_end);
-    result.postprocess_ms = elapsedMs(post_start, post_end);
+    result.bpu.submit_ms = elapsedMs(submit_start, submit_end);
+    result.bpu.wait_ms = elapsedMs(wait_start, wait_end);
+    result.bpu.invalidate_ms = elapsedMs(invalidate_start, invalidate_end);
+    result.bpu.task_release_ms = elapsedMs(release_start, release_end);
+    result.bpu.total_ms = elapsedMs(bpu_start, release_end);
+    result.bpu.core_id = config_.bpu_core_id;
+    result.bpu_ms = result.bpu.total_ms;
+    result.postprocess_ms = result.postprocess.total_ms;
     last_error_.clear();
     return true;
   }

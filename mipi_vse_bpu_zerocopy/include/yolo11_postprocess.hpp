@@ -15,17 +15,25 @@ struct FloatTensorView {
   int channels = 0;
 };
 
+struct PostprocessMetrics {
+  double class_scan_ms = 0.0;
+  double dfl_decode_ms = 0.0;
+  double map_ms = 0.0;
+  double nms_ms = 0.0;
+  double total_ms = 0.0;
+  std::size_t proposals = 0;
+  std::size_t detections = 0;
+};
+
 class Yolo11Postprocessor {
  public:
   Yolo11Postprocessor(float score_threshold, float nms_threshold);
 
   std::vector<Detection> run(
-      const std::array<FloatTensorView, 6>& outputs) const;
+      const std::array<FloatTensorView, 6>& outputs,
+      PostprocessMetrics* metrics = nullptr) const;
 
  private:
-  void decodeScale(const FloatTensorView& classes,
-                   const FloatTensorView& regression, int stride,
-                   std::vector<Detection>& proposals) const;
   std::vector<Detection> nms(std::vector<Detection> proposals) const;
 
   float score_threshold_;

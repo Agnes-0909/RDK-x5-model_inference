@@ -16,6 +16,9 @@ int failures = 0;
 }  // namespace
 
 int main() {
+  const zerocopy::ZeroCopyYoloRunner::Config runner_defaults{};
+  CHECK(runner_defaults.bpu_core_id == zerocopy::kX5BpuCore0);
+
   const zerocopy::ModelInputSpec spec{1, 3, 640, 640, 614400};
   const zerocopy::ExternalMemory memory{
       0x100000, reinterpret_cast<void*>(0x200000), 614400, 614400};

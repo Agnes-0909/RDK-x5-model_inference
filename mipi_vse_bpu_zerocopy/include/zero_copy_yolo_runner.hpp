@@ -3,6 +3,7 @@
 
 #include "buffer_layout.hpp"
 #include "detection.hpp"
+#include "yolo11_postprocess.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -10,6 +11,8 @@
 #include <vector>
 
 namespace zerocopy {
+
+constexpr int kX5BpuCore0 = 1;
 
 struct ModelInputSpec {
   int batch = 0;
@@ -33,6 +36,15 @@ struct InferenceResult {
   std::uint64_t dnn_input_phy = 0;
   double bpu_ms = 0.0;
   double postprocess_ms = 0.0;
+  struct BpuMetrics {
+    double submit_ms = 0.0;
+    double wait_ms = 0.0;
+    double invalidate_ms = 0.0;
+    double task_release_ms = 0.0;
+    double total_ms = 0.0;
+    int core_id = kX5BpuCore0;
+  } bpu;
+  PostprocessMetrics postprocess;
 };
 
 class ZeroCopyYoloRunner {
@@ -42,6 +54,7 @@ class ZeroCopyYoloRunner {
     int timeout_ms = 5000;
     float score_threshold = 0.25F;
     float nms_threshold = 0.45F;
+    int bpu_core_id = kX5BpuCore0;
   };
 
   explicit ZeroCopyYoloRunner(Config config);
