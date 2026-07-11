@@ -4,6 +4,7 @@ model_output_dir
 build_*
 model_convert/onnx2bin/calibration_data_img
 .temporary_workspace
+.worktrees/
 model_convert/onnx2bin/*.bin
 model_convert/onnx2bin/*.log
 model_convert/onnx2bin/*.onnx
