@@ -20,8 +20,6 @@
 
 运行脚本增加 `VISUALIZE`、`VISUAL_DIR`、`VISUAL_INTERVAL`、`VISUAL_MAX_FRAMES` 和 `VISUAL_QUALITY` 环境变量。只有 `VISUALIZE=1` 时脚本才传递可视化参数，保持默认运行无额外复制和线程。
 
-采样从每路第 1 个成功结果开始，此后每隔 `interval` 个成功结果采样，即序号满足 `sequence = 1 + k × interval`；`k < max_frames`，因此 `max_frames` 是每路最多保存的采样张数。
-
 ## 输出结构
 
 ```text
