@@ -44,6 +44,11 @@ add_executable(test_vio_state_machine test/test_vio_state_machine.cpp)
 target_link_libraries(test_vio_state_machine PRIVATE mipi_zerocopy_core)
 add_test(NAME test_vio_state_machine COMMAND test_vio_state_machine)
 
+add_test(NAME no_image_copy
+  COMMAND ${CMAKE_COMMAND}
+    -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/check_no_image_copy.cmake)
+
 option(BUILD_HARDWARE_APP "Build the RDK X5 hardware executable" ON)
 
 set(DNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../3rdlibrary/DNN" CACHE PATH
@@ -70,4 +75,17 @@ if(BUILD_HARDWARE_APP)
     "-Wl,-rpath-link,${RDK_CAMERA_ROOT}/lib")
   target_link_libraries(mipi_zerocopy_dnn PRIVATE
     mipi_zerocopy_core dnn vpf cam hbmem pthread)
+
+  add_executable(mipi_vse_bpu_zerocopy src/main.cpp)
+  target_include_directories(mipi_vse_bpu_zerocopy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${DNN_ROOT}/include
+    ${RDK_CAMERA_ROOT}/include)
+  target_link_directories(mipi_vse_bpu_zerocopy PRIVATE
+    ${DNN_ROOT}/lib ${RDK_CAMERA_ROOT}/lib)
+  target_link_options(mipi_vse_bpu_zerocopy PRIVATE
+    "-Wl,-rpath-link,${DNN_ROOT}/lib"
+    "-Wl,-rpath-link,${RDK_CAMERA_ROOT}/lib")
+  target_link_libraries(mipi_vse_bpu_zerocopy PRIVATE
+    mipi_zerocopy_dnn mipi_zerocopy_core dnn vpf cam hbmem pthread)
 endif()
