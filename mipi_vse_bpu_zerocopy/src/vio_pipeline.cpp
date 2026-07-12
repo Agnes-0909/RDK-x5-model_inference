@@ -216,12 +216,9 @@ class DualVioPipeline::Impl {
   bool initialize() {
     if (initialized_) return true;
     cloneSensorConfig(right_, right_host_);
-    if (!initializeOne(right_)) {
-      stop();
-      return false;
-    }
     cloneSensorConfig(left_, left_host_);
-    if (!initializeOne(left_)) {
+    if (!prepareOne(right_) || !prepareOne(left_) || !startOne(right_) ||
+        !startOne(left_)) {
       stop();
       return false;
     }
@@ -310,7 +307,7 @@ class DualVioPipeline::Impl {
     return false;
   }
 
-  bool initializeOne(Pipeline& pipeline) {
+  bool prepareOne(Pipeline& pipeline) {
     emit(LogLevel::kInfo, "pipeline_initializing", pipeline.channel, -1,
          "configuring MIPI -> VIN -> ISP -> VSE",
          {{"host", static_cast<int64_t>(pipeline.host)}});
@@ -474,15 +471,26 @@ class DualVioPipeline::Impl {
               pipeline.host) ||
         !call("hbn_camera_attach_to_vin",
               hbn_camera_attach_to_vin(pipeline.camera_handle, pipeline.vin),
-              pipeline.host) ||
-        !call("hbn_vflow_start", hbn_vflow_start(pipeline.flow),
+              pipeline.host)) {
+      return false;
+    }
+    emit(LogLevel::kInfo, "pipeline_prepared", pipeline.channel, -1,
+         "hardware flow prepared for synchronized start",
+         {{"host", static_cast<int64_t>(pipeline.host)}});
+    return true;
+  }
+
+  bool startOne(Pipeline& pipeline) {
+    if (!call("hbn_vflow_start", hbn_vflow_start(pipeline.flow),
               pipeline.host)) {
       return false;
     }
     pipeline.flow_started = true;
+    const auto sync = sc132gsHardwareSyncTiming();
     emit(LogLevel::kInfo, "pipeline_started", pipeline.channel, -1,
-         "hardware flow started",
+         "hardware-triggered flow started",
          {{"host", static_cast<int64_t>(pipeline.host)},
+          {"sync_period_us", static_cast<uint64_t>(sync.period_us)},
           {"vse_height", int64_t{640}}, {"vse_width", int64_t{640}}});
     return true;
   }
