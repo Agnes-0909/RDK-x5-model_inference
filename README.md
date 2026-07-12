@@ -1,6 +1,6 @@
 # RDK_proj 工程总览
 
-本仓库面向地瓜机器人 RDK X5 平台，整理了从 YOLO 模型转换、端侧 DNN 推理封装、MIPI 双目摄像头实时推理，到多线程服务化推理和性能分析的完整工程样例。
+本仓库面向地瓜机器人 RDK X5 平台，整理了从 YOLO 模型转换、端侧 DNN 推理封装、MIPI 双目摄像头实时推理，到 MIPI → ISP → VSE → BPU 真零拷贝、双摄硬件同步、多线程服务化推理和性能分析的完整工程样例。
 
 当前仓库的核心目标是打通以下链路：
 
@@ -9,14 +9,18 @@
   -> PT/ONNX/BIN 转换
   -> RDK DNN Runtime 推理封装
   -> 单图/离线推理验证
-  -> MIPI 双目摄像头 NV12 实时推理
+  -> MIPI 双目摄像头实时推理
+  -> ISP/VSE 硬件处理和 BPU 物理地址零拷贝绑定
+  -> LPWM 双摄硬件触发和时间戳同帧配对
   -> 多路输入服务化推理
   -> 日志、可视化和性能分析
 ```
 
 ## 当前重点
 
-近期重点是 `mipi_real_time_proj/`：在 RDK X5 上使用 GS130W 双目 MIPI 摄像头采集 NV12 数据，调用 `model_infer/` 的 YOLO 推理接口完成实时检测，并保存完整链路耗时日志和可视化结果。
+当前重点是 `mipi_vse_bpu_zerocopy/`：在 RDK X5 上让两颗 SC132GS 以 `SLAVE_M` 接收 LPWM 30 FPS 周期触发，左右图像分别经 MIPI host 0/2、VIN、ISP 和 VSE；VSE 输出 `640×640 NV12` 连续物理缓冲，应用直接注册该物理地址并作为 BPU 输入，不执行图像复制或 CPU resize。两路各有独立 worker、模型实例、注册缓存和后处理器，共享板端唯一的 `bpu_core0`。
+
+程序使用 VSE 帧硬件时间戳对齐左右图像，而不是按左右取帧顺序直接配对。2026-07-12 的 300 对板端验收中，左右各成功推理 300 帧，取帧超时、处理失败和零拷贝地址不一致均为 0；全部已接受 pair 的最大时间戳差为 78,750 raw tick，首末 pair 完成区间速率为 15.745 pair/s。时间戳单位和曝光电气边沿仍需 SDK 官方定义、示波器或快速闪光最终确认。
 
 它和仓库内其他模块的关系如下：
 
@@ -27,7 +31,13 @@ model_convert/
 model_infer/
   封装 hbDNN 模型加载、输入预处理、BPU 推理、YOLO 后处理
 
+mipi_vse_bpu_zerocopy/
+  当前重点：SC132GS LPWM 硬件触发，MIPI -> VIN/ISP -> VSE -> BPU
+  VSE 物理地址直接注册为 DNN 输入，双 worker/双模型共享 bpu_core0
+  使用硬件时间戳对齐左右同曝光图像
+
 mipi_real_time_proj/
+  既有应用层实时推理方案
   基于 hobot_mipi_cam 采集 GS130W 双目 NV12 帧
   将 VideoBuffer 封装为 YoloInfer::Nv12Frame
   调用 model_infer 完成左右目实时推理
@@ -56,7 +66,17 @@ RDK_proj/
     test/                               单图推理验证程序
     asset/                              测试图片和可视化示例
 
-  mipi_real_time_proj/                  MIPI 双目摄像头实时推理工程
+  mipi_vse_bpu_zerocopy/               当前重点：双摄硬件同步、VSE-BPU 真零拷贝
+    README.md                           构建、部署、运行、同步和日志说明
+    TECHNICAL_PERFORMANCE_REPORT.md     架构、100 帧基线和 300 对同步验收
+    build.sh                            Docker AArch64 交叉构建入口
+    CMakeLists.txt                      独立工程和测试目标
+    include/                            VIO、帧所有权、同步配对和推理接口
+    src/                                MIPI/VIN/ISP/VSE、零拷贝 BPU、双 worker
+    scripts/run_on_board.sh             板端运行和日志归档入口
+    test/                               零拷贝、硬件同步和资源生命周期测试
+
+  mipi_real_time_proj/                  既有 MIPI 双目应用层实时推理工程
     README.md
     build.sh
     CMakeLists.txt
@@ -94,7 +114,7 @@ RDK_proj/
   -> RDK *.bin
 ```
 
-转换后的 `.bin` 文件供 `model_infer`、`mipi_real_time_proj` 和 `multi_thread_proj` 使用。
+转换后的 `.bin` 文件供 `model_infer`、`mipi_vse_bpu_zerocopy`、`mipi_real_time_proj` 和 `multi_thread_proj` 使用。
 
 详细说明见 [model_convert/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/model_convert/README.md)。
 
@@ -118,9 +138,40 @@ const auto& detections = infer.detections();
 
 详细说明见 [model_infer/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/model_infer/README.md)。
 
-### 3. `mipi_real_time_proj`
+### 3. `mipi_vse_bpu_zerocopy`
 
-`mipi_real_time_proj/` 是当前实时摄像头推理主工程。它基于已下载并导入本仓库的 `hobot_mipi_cam` 代码，完成：
+`mipi_vse_bpu_zerocopy/` 是当前双摄硬件同步、真零拷贝推理主工程，具有独立的 `CMakeLists.txt` 和 `build.sh`，不依赖顶层 CMake 构建。主要能力包括：
+
+- 左右 SC132GS 使用 `SLAVE_M`，由 X5 LPWM 以 30 FPS、33333 µs 周期触发。
+- 两路分别使用 MIPI host 0/2，并在硬件中完成 VIN、ISP、VSE 处理。
+- VSE 将中心 `1088×1088` 区域缩放为模型需要的 `640×640 NV12`。
+- 使用 `hbSysRegisterMem` 注册 VSE 连续物理缓冲，DNN 输入地址与 VSE 地址保持一致。
+- 左右各自使用独立 worker、模型实例、注册缓存和 YOLO11 后处理器，两个实例共享 `bpu_core0`。
+- 按 SDK 硬件时间戳对齐左右帧；时间戳差超过 1,000,000 tick 时释放旧帧并重取，避免把相邻曝光周期误配为一对。
+- 输出文本日志、JSONL、summary、零拷贝地址证据、同步偏差和完整性能指标。
+
+核心数据流：
+
+```text
+X5 LPWM
+  -> left/right SC132GS SLAVE_M
+  -> MIPI host 0/2
+  -> VIN -> ISP -> VSE 640x640 NV12
+  -> hardware timestamp stereo alignment
+  -> hbSysRegisterMem(VSE physical buffer)
+  -> two model instances / two workers
+  -> shared bpu_core0
+  -> YOLO11 CPU postprocess
+  -> VseFrame release
+```
+
+本工程“零拷贝”的准确边界是：应用直接把 VSE 输出物理缓冲注册为 DNN 输入，源码门禁禁止推理路径使用 `hbSysWriteMem`、图像 `memcpy` 和 OpenCV resize；这证明应用可见路径没有显式图像复制，不用于宣称 SDK、驱动或硬件内部绝无复制。
+
+详细说明见 [mipi_vse_bpu_zerocopy/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_vse_bpu_zerocopy/README.md)，技术与性能数据见 [TECHNICAL_PERFORMANCE_REPORT.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_vse_bpu_zerocopy/TECHNICAL_PERFORMANCE_REPORT.md)。
+
+### 4. `mipi_real_time_proj`
+
+`mipi_real_time_proj/` 是既有的实时摄像头应用层推理工程。它基于已下载并导入本仓库的 `hobot_mipi_cam` 代码，完成：
 
 - GS130W 双目摄像头初始化。
 - MIPI host `0/2` 双路采集。
@@ -167,7 +218,7 @@ GS130W left/right sensor
 
 详细说明见 [mipi_real_time_proj/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_real_time_proj/README.md)。
 
-### 4. `multi_thread_proj`
+### 5. `multi_thread_proj`
 
 `multi_thread_proj/` 在 `model_infer` 的单模型能力之上，提供多路输入服务化封装：
 
@@ -201,9 +252,33 @@ cd /project/model_infer
   --classes 80
 ```
 
-### 路径 B：运行 MIPI 双目实时推理
+### 路径 B：运行双摄硬件同步、VSE-BPU 真零拷贝推理
 
-适合接入 GS130W 摄像头，验证从采集到推理再到可视化的完整链路。
+适合验证当前主链路：LPWM 同参数触发两颗 SC132GS，MIPI/VIN/ISP/VSE 硬件处理，VSE 物理缓冲直接注册给 BPU，并按硬件时间戳配对左右图像。
+
+编译：
+
+```bash
+docker exec 3c543521b4ca bash -lc \
+  'cd /project/mipi_vse_bpu_zerocopy && ./build.sh'
+```
+
+部署和板端运行：
+
+```bash
+cd mipi_vse_bpu_zerocopy
+ssh root@192.168.1.12 'mkdir -p /root/mipi_vse_bpu_zerocopy'
+scp build_aarch64/mipi_vse_bpu_zerocopy scripts/run_on_board.sh \
+  root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/
+ssh root@192.168.1.12 \
+  'cd /root/mipi_vse_bpu_zerocopy && FRAMES=300 LOG_LEVEL=info ./run_on_board.sh'
+```
+
+每次运行会生成 `run.log`、`events.jsonl`、`console.log` 和 `summary.json`。同步最大偏差及左右主动对齐丢帧数记录在 `events.jsonl` 的 `summary.run_complete` 事件中。
+
+### 路径 C：运行既有 MIPI 应用层实时推理
+
+适合通过 `hobot_mipi_cam + model_infer` 验证从采集、应用层 NV12 视图到推理和 JPEG 可视化的既有链路。该工程的零拷贝边界与 `mipi_vse_bpu_zerocopy` 不同。
 
 编译：
 
@@ -244,7 +319,7 @@ summary.txt      每通道统计汇总
 vis/             左右目 JPEG 可视化
 ```
 
-### 路径 C：多线程服务化推理
+### 路径 D：多线程服务化推理
 
 适合离线多路图片或视频帧输入、批量调度和多 worker 服务化验证。
 
@@ -263,7 +338,7 @@ cd /project/multi_thread_proj
 - `aarch64-linux-gnu-gcc`
 - `aarch64-linux-gnu-g++`
 - RDK DNN SDK
-- aarch64 OpenCV
+- aarch64 OpenCV（`model_infer`、`mipi_real_time_proj` 使用；`mipi_vse_bpu_zerocopy` 核心链路不依赖 OpenCV）
 
 ### MIPI 摄像头工程额外依赖
 
@@ -272,6 +347,7 @@ cd /project/multi_thread_proj
 - `hb_camera_interface.h`
 - `vin_cfg.h`
 - `hb_media_codec.h`
+- `hb_mem_mgr.h`
 - GS130W 对应 sensor 配置和标定文件
 
 本仓库默认依赖目录：
@@ -291,6 +367,23 @@ cd /project/multi_thread_proj
 ```bash
 cd model_infer
 ./build.sh
+```
+
+### 构建 `mipi_vse_bpu_zerocopy`
+
+```bash
+docker exec 3c543521b4ca bash -lc \
+  'cd /project/mipi_vse_bpu_zerocopy && ./build.sh'
+```
+
+### 检查硬件同步和零拷贝静态门禁
+
+```bash
+docker exec 3c543521b4ca bash -lc '
+  cd /project/mipi_vse_bpu_zerocopy
+  cmake -DPROJECT_SOURCE_DIR="$PWD" -P test/check_hardware_sync_config.cmake
+  cmake -DPROJECT_SOURCE_DIR="$PWD" -P test/check_no_image_copy.cmake
+'
 ```
 
 ### 构建 `mipi_real_time_proj`
@@ -316,7 +409,7 @@ cd multi_thread_proj
 
 ## 板端检查命令
 
-MIPI 摄像头不出图或 `getFrame` 返回空时，优先在板端检查：
+MIPI 摄像头不出图，或 `getFrame`/`hbn_vnode_getframe` 失败时，优先在板端检查：
 
 ```bash
 cat /sys/class/socinfo/board_id
@@ -331,10 +424,14 @@ channel=0
 channel2=2
 ```
 
+`mipi_vse_bpu_zerocopy` 默认直接使用 MIPI host 0/2，并从设备树读取每路 `rx_phy`、`lpwm_chn`、GPIO 和 I2C 路由；初始化失败时应结合 `run.log`、`console.log` 和内核日志检查传感器 ID、LPWM/FSIN 连接及 VIO 资源占用。
+
 ## 文档导航
 
 - [model_convert/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/model_convert/README.md)：模型导出和 RDK BIN 转换。
 - [model_infer/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/model_infer/README.md)：DNN 推理基础库、YOLO 推理接口、单图验证。
+- [mipi_vse_bpu_zerocopy/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_vse_bpu_zerocopy/README.md)：当前双摄 LPWM 硬件同步、MIPI/VIN/ISP/VSE、BPU 真零拷贝工程。
+- [mipi_vse_bpu_zerocopy/TECHNICAL_PERFORMANCE_REPORT.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_vse_bpu_zerocopy/TECHNICAL_PERFORMANCE_REPORT.md)：架构、指标口径、100 帧基线和 300 对同步验收。
 - [mipi_real_time_proj/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/mipi_real_time_proj/README.md)：GS130W 双目 MIPI 实时推理、数据流、日志和可视化。
 - [multi_thread_proj/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/multi_thread_proj/README.md)：多路输入、多 worker、共享内存服务化推理。
 - [skills/README.md](/Users/xurongtang/workerFolder/RDK_resource/RDK_proj/skills/README.md)：自建 skill 和性能优化工作流。
@@ -343,5 +440,7 @@ channel2=2
 
 - 修改 `model_infer` 的推理接口时，同步检查 `mipi_real_time_proj` 和 `multi_thread_proj` 的调用。
 - 修改 MIPI 默认 camera 参数时，同步更新 `mipi_real_time_proj/README.md`、`defaultConfig()` 和 `test_mipi_zero_copy_config.cpp`。
+- 修改 `mipi_vse_bpu_zerocopy` 的帧率、sensor mode 或 LPWM 参数时，同步更新其 README、技术性能报告和 `check_hardware_sync_config.cmake`，并重新执行至少 300 对板端同步验收。
+- 修改 VSE 输出布局或 DNN 输入绑定时，必须保持 `no_image_copy`、地址一致性日志和 11 个板端测试通过，禁止静默退化到 CPU copy/resize。
 - 新增模型时，先用 `model_infer/test_yolo_infer` 验证单图结果，再接入 MIPI 或多线程工程。
-- 板端性能问题优先查看 `run.log`、`frames.jsonl` 和 `summary.txt`，区分瓶颈发生在取帧、预处理、BPU 执行、后处理还是可视化保存。
+- 板端性能问题按工程查看日志：`mipi_vse_bpu_zerocopy` 使用 `run.log`、`events.jsonl`、`console.log` 和 `summary.json`；`mipi_real_time_proj` 使用 `run.log`、`frames.jsonl` 和 `summary.txt`。分析时区分取帧/同步、VSE、BPU、后处理和可视化开销。
