@@ -1,10 +1,12 @@
-# MIPI-VSE-BPU 双路零拷贝技术与性能报告
+# MIPI-VSE-BPU 双路硬件同步、零拷贝技术与性能报告
 
 ## 1. 报告摘要
 
-本报告记录 `mipi_vse_bpu_zerocopy` 在 RDK X5 上的一次双路 100 帧工程基线。左右 SC132GS 图像分别经 MIPI host 0/2、VIN、ISP 和 VSE；VSE 将 `1088×1280 NV12` 输入的中心 `1088×1088` 区域缩放为 `640×640 NV12`。应用用 `hbSysRegisterMem` 注册 VSE 输出物理内存，交给两个独立模型实例和 worker（每路独立处理线程）；二者均绑定同一个 `bpu_core0`（BPU 硬件执行核心 0），随后在 CPU 上执行 YOLO11 后处理（postprocess，即输出扫描、解码、坐标映射和 NMS）并归还 VSE 帧。
+本报告记录 `mipi_vse_bpu_zerocopy` 在 RDK X5 上的双路硬件同步、零拷贝和单 BPU core 并发推理实现，并保留两组用途不同的实测数据：2026-07-11 的双路各 100 帧详细性能基线，以及 2026-07-12 的 300 对硬件同步验收。左右 SC132GS 由 X5 LPWM 持续触发曝光，图像分别经 MIPI host 0/2、VIN、ISP 和 VSE；VSE 将 `1088×1280 NV12` 输入的中心 `1088×1088` 区域缩放为 `640×640 NV12`。应用按硬件时间戳对齐左右帧，用 `hbSysRegisterMem` 注册 VSE 输出物理内存，交给两个独立模型实例和 worker；二者均绑定同一个 `bpu_core0`，随后在 CPU 上执行 YOLO11 后处理并归还 VSE 帧。
 
 实测事实如下：左右各成功处理 100 帧，失败、超时、释放错误和物理地址不一致均为 0；200/200 次推理满足 `vse_phy == dnn_phy`，每路注册缓存为 3 miss/97 hit。左右 worker 端到端均值分别为 63.424 ms 和 63.116 ms，其中 BPU 均值分别为 59.965 ms 和 59.599 ms，后处理均值分别为 3.319 ms 和 3.376 ms。
+
+硬件同步验收连续处理 300 对：左右各成功 300 帧，取帧 timeout、处理失败、释放错误和物理地址不一致均为 0，600/600 次推理满足 `vse_phy == dnn_phy`。时间戳对齐主动释放左 17 帧、右 253 帧旧图像；全部 300 对持续跟踪的最大配对差为 78,750 raw timestamp tick。左右 worker 端到端均值为 61.928/62.948 ms，首末 pair 完成区间速率为 15.745381 pair/s。该次运行证明 LPWM slave 模式下的软件配对稳定，但 raw tick 的官方单位和两颗传感器曝光电气边沿仍需 SDK 文档、示波器或快速闪光进一步确认。
 
 FPS 指每秒完成帧数；aggregate FPS 是左右路合计完成速率，pair 是按完成顺序将第 k 个左/右结果配成一对，paired FPS 是每秒完成的 pair 数。窗口计数口径为 31.708932 aggregate FPS、15.854466 paired FPS；更严格按 `N-1` 个完成间隔计算的**首末完成区间速率**为 31.550388 aggregate FPS、15.778467 paired FPS。后者排除了首个完成前的启动时间，但没有剔除预热、检查滚动稳定性或覆盖多次运行，不能称为或证明稳态性能。结合 BPU 内部计时，`wait_ms` 占总耗时的绝大部分，单 core BPU 调度/执行是当前主要瓶颈。双 worker 没有使 BPU 算力翻倍，其价值是隔离两路生命周期与背压，并允许一侧 CPU 后处理同另一侧任务调度/执行发生重叠。
 
@@ -21,26 +23,35 @@ FPS 指每秒完成帧数；aggregate FPS 是左右路合计完成速率，pair 
 | 测试参数 | 每路 100 帧，score 0.25，NMS 0.45，`LOG_LEVEL=info` | 运行脚本默认值及启动事件 |
 | 主性能测试 | 2026-07-11 22:18:31 至 22:18:41，UTC+08:00（Asia/Shanghai） | 日志 `wall_time`；目录 `run_20260711_221831` |
 | debug 测试 | 2026-07-11，UTC+08:00，每路 2 帧，`LOG_LEVEL=debug` | 目录 `run_20260711_221544` |
+| 硬件同步验收 | 2026-07-12 10:39:34 至 10:39:56，UTC+08:00；每路 300 帧，`LOG_LEVEL=info` | 目录 `run_20260712_103934` |
+| 同步配置 | SC132GS `SLAVE_M`；30 FPS；LPWM period 33333 µs、offset 10 µs、duty 100 µs | 传感器配置、`hardware_sync_config` 静态门禁 |
 | 构建环境 | README 记录 Docker 容器 `3c543521b4ca`，交叉构建产物为 `build_aarch64/mipi_vse_bpu_zerocopy` | 工程 README |
 | 频率/温度/功耗模式 | 未记录 | 不据此推断降频或功耗表现 |
-| SDK/Runtime 精确版本 | 未记录 | 本报告不杜撰版本号 |
+| 同步验收 Runtime | BPU Platform 1.3.6；DNN Runtime 1.24.5（HBRT 3.15.55）；模型 builder 1.24.3 | `run_20260712_103934/console.log`；原 100 帧基线未记录精确版本 |
 
-主性能数据源为板端 `root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221831/` 下的 `events.jsonl`、`summary.json` 和 `run.log`；后处理分段数据源为 `root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221544/events.jsonl`。报告数值来自已校验的 `/tmp/mipi_vse_performance_metrics.json`，未重新运行板端测试。
+主性能数据源为板端 `root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221831/` 下的 `events.jsonl`、`summary.json` 和 `run.log`；后处理分段数据源为 `root@192.168.1.12:/root/mipi_vse_bpu_zerocopy/logs/run_20260711_221544/events.jsonl`。同步验收数据源为 `root@192.168.1.12:/root/mipi_vse_bpu_zerocopy_sync_test/logs/run_20260712_103934/` 下的 `events.jsonl`、`summary.json`、`run.log` 和 `console.log`，于 2026-07-12 从板端重新复制并复算。两组运行不混用样本：100 帧数据用于原详细基线，300 对数据用于同步验收和更新后的性能观察。
 
 ## 3. 系统链路与并发架构
 
 ```text
-左 SC132GS -> MIPI0 -> VIN -> ISP -> VSE 640x640 NV12 -> [容量 1] -> 左 worker -> register/cache -> 左模型 --+
-                                                                                                            |
-                                                                                                     共享 bpu_core0
-                                                                                                            |
-右 SC132GS -> MIPI2 -> VIN -> ISP -> VSE 640x640 NV12 -> [容量 1] -> 右 worker -> register/cache -> 右模型 --+
+                         +-> 左 SC132GS(SLAVE_M) -> MIPI0 -> VIN -> ISP -> VSE -> 左 VseFrame --+
+X5 LPWM 30 FPS 同参数触发 -+                                                                  |
+                         +-> 右 SC132GS(SLAVE_M) -> MIPI2 -> VIN -> ISP -> VSE -> 右 VseFrame --+
+                                                                                               |
+                                             硬件时间戳对齐（旧帧 release，差值 <= 1,000,000 tick）
+                                                                                               |
+                       +-> [左容量 1 队列] -> 左 worker -> register/cache -> 左模型 --+          |
+                       |                                                           |          |
+                       |                                                    共享 bpu_core0     |
+                       |                                                           |          |
+                       +-> [右容量 1 队列] -> 右 worker -> register/cache -> 右模型 --+----------+
 
-BPU 完成 -> 左 worker -> 左 CPU 后处理 -> 左 VseFrame release
-BPU 完成 -> 右 worker -> 右 CPU 后处理 -> 右 VseFrame release
+BPU 完成 -> 对应 worker -> CPU 后处理 -> 对应 VseFrame release
 ```
 
-每路 VSE 配置 3 个连续缓冲区。主线程先后取得左右帧，再通过 move-only 的 `VseFrame` 将所有权移入对应的容量 1 队列。队列只有一个 `optional<VseFrame>` 槽位：worker 未取走上一帧时，生产者在 `push` 阻塞，从而把处理能力不足反向传播到取帧侧，限制在途帧和延迟积累；关闭队列会唤醒生产者和消费者。100 帧运行中累计 push 等待只有左 0.068 ms、右 0.036 ms，说明该次运行未出现显著的生产者阻塞，但容量 1 的背压约束仍然成立。
+每路 VSE 配置 3 个连续缓冲区。程序先完成左右 flow 的 camera/VIN/ISP/VSE 创建、绑定和 attach，再启动右、左 flow。主线程先后取得左右帧，读取 SDK `image.info.timestamps`；差值不超过 1,000,000 tick 才组成一对，超过阈值时立即 release 时间戳较旧的帧并重取该路，最多重对齐 16 次，时间戳缺失则终止运行。完成配对后，通过 move-only 的 `VseFrame` 将所有权移入对应容量 1 队列。
+
+队列只有一个 `optional<VseFrame>` 槽位：worker 未取走上一帧时，生产者在 `push` 阻塞，从而把处理能力不足反向传播到取帧侧，限制在途帧和延迟积累；关闭队列会唤醒生产者和消费者。100 帧基线中累计 push 等待只有左 0.068 ms、右 0.036 ms；300 对同步验收中为左 0.221 ms、右 0.115 ms。push 等待仍很小，但相机为 30 FPS、单 core pair 完成速率约 15.75 pair/s，因此 VSE 取帧会跳帧，两路跳帧数可能不同；时间戳重对齐负责防止把相邻曝光周期误配为一对。
 
 `VseFrame` 禁止复制，只允许 move。它持有 `hbn_vnode_image_t` 的释放闭包；所有权从主线程移到队列、再移到 worker。worker 完成推理和后处理后显式调用 `release()`，异常或提前退出时析构函数也提供一次性释放保障。
 
@@ -57,6 +68,8 @@ BPU 完成 -> 右 worker -> 右 CPU 后处理 -> 右 VseFrame release
 | 注册缓存 miss | 3 | 3 | 与每路 3 个 VSE buffer 一致 |
 | 注册缓存 hit | 97 | 97 | 每路命中率 97% |
 | core index/mask 不符 | 0 | 0 | 200 次均为 index 0、mask 1 |
+
+300 对硬件同步验收再次得到 600/600 次 `vse_phy == dnn_phy`，左右仍分别只有 3 次 cache miss 和 297 次 hit，地址不一致、处理失败和 release error 均为 0。这组数据独立于上表的 100 帧基线，是同步改造后零拷贝路径未退化的回归证据。
 
 此外，CMake 测试 `no_image_copy` 静态扫描推理路径，禁止 `hbSysWriteMem`、图像 `memcpy` 和 `cv::resize`；布局校验也禁止静默退化到 CPU copy/resize。这些是应用可见路径的静态策略门禁。
 
@@ -76,12 +89,18 @@ BPU 完成 -> 右 worker -> 右 CPU 后处理 -> 右 VseFrame release
 | worker `postprocess_ms` | `Yolo11Postprocessor::run` 内部 | 分类扫描、DFL 解码、坐标映射和 NMS |
 | worker `end_to_end_ms` | worker 出队后、调用 `processor_->process` 前，至该调用返回后 | 注册缓存查询/首次注册、BPU、CPU 后处理，以及 processor 内日志事件构造和 `AsyncLogger::log` 同步入队；不含 VSE frame release |
 | queue push/pop wait | 相应条件变量等待前后，summary 为逐路累计值 | 容量 1 背压或消费者等帧的累计等待 |
+| `hardware_timestamp` | SDK `hbn_vnode_image_t.info.timestamps` | 原样保存在 `VseFrame` 中，单位未由本报告擅自换算 |
+| `skew_ticks` | 左右硬件时间戳绝对差 | 仅当差值不超过 1,000,000 tick 时进入推理；每 30 对抽样记录 |
+| `max_timestamp_skew_ticks` | 所有已接受 pair 的最大时间戳绝对差 | `summary.run_complete` 持续统计，不等同于每 30 对抽样事件中的最大值 |
+| `left/right_sync_drops` | 时间戳对齐过程中主动释放的旧 VSE 帧数 | 不是取帧 timeout、推理失败或传感器丢帧错误计数 |
 
-`worker.end_to_end_ms` 不是曝光到检测输出的全链路延迟：它不含 MIPI 曝光、VIN、ISP/VSE 硬件处理、主线程 `hbn_vnode_getframe`、左右取帧配对和入队前/队列等待，也不含处理后的 `hbn_vnode_releaseframe`。BPU 局部 timer 和 postprocess 局部 timer 均在相应日志事件之前结束，因而排除日志事件开销。与之不同，`end_to_end_ms` 包围整个 `processor_->process` 调用，包含 processor 内 registration、DNN 和 postprocess 事件的字段/对象构造，以及 `AsyncLogger::log` 的同步入队开销（包括 mutex、时间戳处理和队列满时的等待）；它不包含异步 writer 线程中的文本/JSON 序列化和文件 I/O，也不包含 timer 结束后才提交的 `worker.frame_processed` 事件。
+`worker.end_to_end_ms` 不是曝光到检测输出的全链路延迟：它不含 MIPI 曝光、VIN、ISP/VSE 硬件处理、主线程 `hbn_vnode_getframe`、时间戳重对齐、入队前/队列等待，也不含处理后的 `hbn_vnode_releaseframe`。BPU 局部 timer 和 postprocess 局部 timer 均在相应日志事件之前结束，因而排除日志事件开销。与之不同，`end_to_end_ms` 包围整个 `processor_->process` 调用，包含 processor 内 registration、DNN 和 postprocess 事件的字段/对象构造，以及 `AsyncLogger::log` 的同步入队开销（包括 mutex、时间戳处理和队列满时的等待）；它不包含异步 writer 线程中的文本/JSON 序列化和文件 I/O，也不包含 timer 结束后才提交的 `worker.frame_processed` 事件。
 
 ## 6. 测试方法与数据口径
 
-主测试从 `events.jsonl` 按 `channel` 收集 100 条 `dnn.inference_complete` 和 100 条 `worker.frame_processed`。分位数在升序数组位置 `(n-1)×p` 上做线性插值，分别取 P50/P90/P95/P99；这一定义用于避免不同统计工具默认算法不一致。计算均值同 `summary.json` 逐路交叉检查，绝对差均小于 0.001 ms。正文耗时统一显示到 0.001 ms，完整精度保留在已校验 JSON 中。
+100 帧主测试从 `events.jsonl` 按 `channel` 收集 100 条 `dnn.inference_complete` 和 100 条 `worker.frame_processed`；300 对同步验收分别收集 300 条，即合计 600 条各类完成事件。两组数据独立统计。分位数在升序数组位置 `(n-1)×p` 上做线性插值，分别取 P50/P90/P95/P99；这一定义用于避免不同统计工具默认算法不一致。计算均值同各自 `summary.json` 逐路交叉检查，正文耗时统一显示到 0.001 ms。
+
+同步验收仅每 30 对输出一次 `stereo_sync_sample`，所以 10 个抽样点只能用于检查运行过程，不能用来重建全部 300 对的时间差分布。`run_complete.max_timestamp_skew_ticks=78750` 是程序对每一个已接受 pair 持续更新的全量最大值；10 个抽样点的 min/mean/max 为 28,208/53,145.9/72,708 tick。报告用 78,750 作为验收最大值，不用抽样最大值替代全量统计。
 
 每路只有 100 个样本时，线性插值 P99 的位置为 98.01，几乎完全由最慢 1–2 个样本决定。因此本报告的 P99 仅为探索性统计，不用于性能认证或优化验收。约 100 帧的基线应主要观察 P90、P95、max 及相应原始慢样本；若要把 P95/P99 作为验收指标，应每路每次至少采集 1000 帧、重复多次运行，并报告跨运行离散度或置信区间。
 
@@ -152,7 +171,68 @@ Worker 汇总（其中 `bpu_ms` 直接映射上述 `total_ms`）：
 | 可读日志一致性 | `run.log` 423 行，各事件计数与 `events.jsonl` 一致 |
 | 退出状态 | `summary.exit_code=0` 且 `summary.run_complete.exit_code=0`，summary error 为空 |
 
-## 8. 后处理耗时构成
+## 8. 300 对硬件同步验收
+
+### 8.1 同步工作方式
+
+两颗 SC132GS 的 camera mode 为 `SLAVE_M`，VIN LPWM enabled；camera、MIPI 和 LPWM 均按 30 FPS 配置，LPWM period/offset/duty 分别为 33333/10/100 µs。ISP 保持 `ISP_NORMAL_M`，因为 slave 表示传感器外部曝光触发，不是 ISP HDR 模式。两路 flow 先全部 prepare，再依次 start，避免在第二路仍初始化时让第一路提前长期自由运行。
+
+硬件同步曝光和软件同帧配对是两个层次。两路共享一个 BPU core，pair 完成能力约为相机触发频率的一半，主线程再次取帧时左右 VSE 可能各自跳过不同数量的帧。因此程序以硬件时间戳而不是 `frame_id` 或取帧顺序配对：差值不超过 1,000,000 tick 时接受；否则释放时间戳更旧的一路并重取。启动瞬态也通过同一机制消除。`frame_id` 可以因两路启动计数偏移而不同，只要硬件时间戳落在阈值内，仍视为同一曝光周期的候选 pair。
+
+### 8.2 完整性与同步结果
+
+数据来自 `run_20260712_103934`，运行从 2026-07-12 10:39:34.699 至 10:39:56.943（UTC+08:00）。
+
+| 指标 | 左 | 右 | 总体/结论 |
+|---|---:|---:|---|
+| 成功帧 | 300 | 300 | 600 |
+| 检测框 | 302 | 345 | 647 |
+| 处理失败 | 0 | 0 | 0 |
+| VSE release error | 0 | 0 | 0 |
+| 取帧 timeout | 0 | 0 | 0 |
+| cache miss / hit | 3 / 297 | 3 / 297 | 与每路 3 个 VSE buffer 一致 |
+| address mismatch | 0 | 0 | 600/600 `vse_phy == dnn_phy` |
+| 时间戳对齐主动丢帧 | 17 | 253 | 旧帧释放，不计为错误 |
+| 已接受 pair 最大差值 | — | — | **78,750 raw tick** |
+
+左右主动丢帧不对称不是左右相机错误率：主线程固定先取左、再取右，而 BPU 反压使采集时刻跨越多个 30 FPS 周期，右路更常保留较旧的待取缓冲，时间戳算法因此更多刷新右路。验收关注的是所有提交推理的 pair 都在阈值内、运行无 timeout/error，以及最大差值稳定远小于一个 33,333 µs 帧周期；主动丢帧计数本身不应解释为传感器硬件丢帧率。
+
+SDK 字段名和本次序列增量表明 `timestamps` 很可能采用 ns 量级，但本工程没有引用到官方时钟单位定义，因此报告保留 raw tick，不把 78,750 写成正式的 78.750 µs 测量结论。时间戳配对只能证明进入推理的左右图像在 SDK 时钟上接近；两颗传感器 FSIN/曝光电气边沿仍需示波器或快速闪光最终验收。
+
+### 8.3 300 帧性能观察
+
+下表单位为 ms，分位数采用第 6 节定义的线性插值。与 100 帧基线相比，本节样本更多，但仍只有单次运行，不能替代多次 ≥1000 帧的正式稳态性能认证。
+
+| 路 | 指标 | count | min | mean | P50 | P95 | P99 | max |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 左 | `bpu_ms` | 300 | 35.505 | 58.663 | 59.911 | 64.575 | 67.727 | 69.854 |
+| 左 | `postprocess_ms` | 300 | 2.975 | 3.140 | 3.030 | 3.106 | 3.831 | 14.924 |
+| 左 | `end_to_end_ms` | 300 | 38.862 | 61.927 | 63.058 | 68.070 | 72.092 | 75.876 |
+| 右 | `bpu_ms` | 300 | 35.926 | 59.524 | 59.896 | 66.530 | 67.911 | 71.290 |
+| 右 | `postprocess_ms` | 300 | 2.966 | 3.298 | 3.030 | 3.163 | 13.378 | 14.898 |
+| 右 | `end_to_end_ms` | 300 | 39.042 | 62.948 | 63.042 | 70.308 | 75.877 | 84.608 |
+
+吞吐仍按完成端首末区间计算：
+
+| 口径 | 公式 | 时间窗 | 结果 |
+|---|---|---:|---:|
+| window aggregate | 600 / 首末 worker 完成窗 | 19.020908 s | 31.544235 FPS |
+| aggregate intercompletion | 599 / 首末 worker 完成窗 | 19.020908 s | 31.491662 FPS |
+| window pair | 300 / 首末 pair 完成窗 | 18.989696 s | 15.798041 pair/s |
+| pair intercompletion | 299 / 首末 pair 完成窗 | 18.989696 s | **15.745381 pair/s** |
+
+与原 100 帧基线的 15.778467 pair/s 接近，继续支持“单 `bpu_core0` 调度/执行是吞吐主瓶颈”的工程判断。同步重对齐没有进入 worker timer，因此这些 `end_to_end_ms` 仍不是曝光到结果的完整延迟。
+
+### 8.4 构建与测试验收
+
+合并到 `main` 后，从 `/project/mipi_vse_bpu_zerocopy` 重新执行 Docker AArch64 完整构建，硬件同步和零拷贝两项 CMake 静态门禁通过；11 个 AArch64 测试程序复制到 X5 后全部 PASS。新增的关键覆盖包括：
+
+- `hardware_sync_config`：30 FPS、SC132GS `SLAVE_M`、LPWM enabled、运行时不得关闭 LPWM，以及双 flow 必须先 prepare 后 start。
+- `test_stereo_frame_sync`：对齐、刷新左旧帧、刷新右旧帧和时间戳缺失四类决策。
+- `test_bounded_frame_queue`：`VseFrame` 经 move 和队列传递后仍保留 hardware timestamp。
+- `no_image_copy`：同步改造后推理路径仍不得出现图像 copy/CPU resize。
+
+## 9. 后处理耗时构成
 
 本节只使用 `run_20260711_221544` 的 debug 事件，每路仅 2 个样本。JSON 明确记录 `percentiles_robust=false`。这里展示每个实际值和算术均值，仅用于解释处理阶段；不报告或引用其分位数，也不外推为稳定性能结论。后续取得每路至少 30 个 debug 样本，也只能用于阶段构成和均值的初步观察；若要验收 P95/P99，仍应采用每路每次至少 1000 帧并重复多次运行的主测试口径。
 
@@ -176,7 +256,7 @@ Worker 汇总（其中 `bpu_ms` 直接映射上述 `total_ms`）：
 
 这 4 帧中 class scan 是后处理总耗时的主要组成，DFL、map 和 NMS 较小；这是对代码阶段和样本机制的直接观察。左路第二个样本 class scan 较高，但样本数不足，不能据此断言通道固有差异或尾延迟成因。
 
-## 9. 性能瓶颈分析
+## 10. 性能瓶颈分析
 
 以下明确区分事实与推断。
 
@@ -186,8 +266,9 @@ Worker 汇总（其中 `bpu_ms` 直接映射上述 `total_ms`）：
 - **后处理事实：** 100 帧 info 运行中，左右后处理均值为 3.319/3.376 ms，约为 worker 端到端均值的 5%；平均瓶颈不是 CPU 后处理。左路 postprocess P99/max 为 13.159/15.660 ms，右路为 14.659/14.689 ms；其中 P99 受最慢 1–2 个样本主导，只能提示检查原始慢样本，不能作为尾延迟认证或优化验收结论。
 - **通道比较：** 左右均值和 P50 很接近；左路 BPU P95 较高（66.377 vs 63.803 ms），右路 worker 端到端 P99 较高（75.909 vs 74.630 ms）。这些是探索性差异，单次各 100 帧不足以归因于传感器、线程调度或热状态。
 - **背压事实：** push 累计等待不足 0.100 ms/路，未显示队列饱和是本次瓶颈；容量 1 主要承担延迟上界与资源所有权保护，不能从低等待值推断可以无限增大队列。
+- **同步与吞吐：** 300 对验收中 pair intercompletion 为 15.745381 pair/s，而传感器由 LPWM 以 30 FPS 触发；处理端不可能消费每个曝光周期。时间戳重对齐主动释放旧帧是“保最新同曝光 pair”的策略结果，不是通过加深队列就能消除的错误。
 
-## 10. 优化建议
+## 11. 优化建议
 
 建议按以下优先级推进；“预期验证指标”是验收方法，不是收益承诺。
 
@@ -196,10 +277,11 @@ Worker 汇总（其中 `bpu_ms` 直接映射上述 `total_ms`）：
 | P0 | 先建立可重复基线：相同模式多次运行，每路每次至少 1000 帧；另采集每路至少 30 帧 debug 分段；同时记录 BPU/CPU 频率、温度和功耗模式 | 当前只有一次 100 帧和每路 2 个 debug 样本 | 首末完成区间 aggregate/pair rate 的跨运行均值与离散度；延迟 P95/P99 的跨运行离散度或置信区间；debug 只初步观察阶段构成/均值；无错误、无地址 mismatch |
 | P1 | 优先评估模型与 BPU runtime 路径：在精度约束下比较更轻模型/编译配置；若 SDK 提供排队与执行拆分埋点则启用 | wait 约占 BPU total 的 99%，收益空间主要在此 | 在上述 ≥1000 帧、多次运行口径下，`wait_ms` mean/P95 下降，pair intercompletion interval rate 上升；检测精度不低于业务阈值；core/address 校验仍通过 |
 | P2 | 针对 CPU 后处理尾部做 profiling，检查 class scan 的数据依赖、临时分配和调度抖动，再决定是否复用缓冲或向量化 | 平均约 3.3 ms，不是首要瓶颈；当前 100 帧 P99 仅提供慢样本线索 | 先复核 P90/P95/max 对应原始样本；正式验收使用每路每次 ≥1000 帧的 postprocess mean/P95/P99，并报告多次运行离散度 |
-| P3 | 增加曝光/采集、VSE 完成、入队、出队、输出就绪时间戳，并单独计量 VSE release | 现有 `end_to_end` 不是相机到结果全链路 | 可报告 exposure-to-output、VIO、queue 和 release 的独立分布，并保证日志开销经 A/B 验证可接受 |
-| P4 | 保持容量 1 为默认；只有在证实 BPU 空洞由供帧抖动造成时，才 A/B 测试更深队列或调度策略 | 本次 push wait 极小，盲目扩容更可能增加陈旧帧延迟 | 多次运行的 intercompletion interval rate 改善且完整链路 P95 不恶化；内存/在途帧上限明确；release/error 仍为 0 |
+| P3 | 在已有 VSE hardware timestamp 基础上，补充经官方时钟单位确认的曝光/触发、入队、出队、输出就绪时间戳，并单独计量 VSE release | 当前能对齐 VSE 输出，但 `end_to_end` 仍不是相机曝光到结果的全链路 | 可报告 exposure-to-output、VIO、同步重对齐、queue 和 release 的独立分布，并保证日志开销经 A/B 验证可接受 |
+| P4 | 用双通道示波器或同时照射两颗传感器的快速闪光验证曝光电气边沿；若独立 LPWM 有固定相差，将一个触发信号物理扇出到两颗 sensor FSIN | SDK 时间戳接近不能替代传感器引脚/曝光窗口测量 | 多次启动后曝光边沿差和抖动满足业务阈值；与 `skew_ticks` 变化趋势一致 |
+| P5 | 保持容量 1 为默认；只有在证实 BPU 空洞由供帧抖动造成时，才 A/B 测试更深队列或调度策略 | 本次 push wait 极小，盲目扩容更可能增加陈旧帧延迟，并增加同曝光 pair 过期风险 | 多次运行的 intercompletion interval rate 改善且完整链路 P95 不恶化；内存/在途帧上限明确；release/error 仍为 0 |
 
-## 11. 复现与诊断命令
+## 12. 复现与诊断命令
 
 前置条件：Docker 构建容器已运行且仓库挂载到 `/project`；X5 可通过 root SSH 访问且未被其他 VIO 应用占用；模型已部署到板端；宿主机具备 `ssh`、`scp` 和 Python 3。下面 jq 诊断块还要求板端安装 `jq`；没有 jq 时可复制日志并使用随后给出的纯 Python 替代。以下命令应在同一个宿主 shell 中执行，先设置环境变量：
 
@@ -225,6 +307,65 @@ scp build_aarch64/mipi_vse_bpu_zerocopy scripts/run_on_board.sh \
   root@"$BOARD_IP":/root/mipi_vse_bpu_zerocopy/
 ssh root@"$BOARD_IP" \
   "cd /root/mipi_vse_bpu_zerocopy && MODEL='$MODEL' FRAMES=100 LOG_LEVEL=info ./run_on_board.sh"
+```
+
+运行硬件同步验收建议至少 300 对，并从 `run_complete` 读取全量最大偏差和主动对齐丢帧数：
+
+```bash
+ssh root@"$BOARD_IP" \
+  "cd /root/mipi_vse_bpu_zerocopy && MODEL='$MODEL' FRAMES=300 LOG_LEVEL=info ./run_on_board.sh"
+ssh root@"$BOARD_IP" 'bash -s' <<'SH'
+cd /root/mipi_vse_bpu_zerocopy
+RUN_DIR="$(find logs -maxdepth 1 -type d -name 'run_*' | sort | tail -1)"
+jq -c 'select(.component=="sync" and .event=="stereo_sync_sample")' \
+  "$RUN_DIR/events.jsonl"
+jq -c 'select(.component=="summary" and .event=="run_complete")' \
+  "$RUN_DIR/events.jsonl"
+SH
+```
+
+验收时至少检查：左右成功数相等、timeout/error/address mismatch 均为 0、`max_timestamp_skew_ticks` 低于业务阈值。`left/right_sync_drops` 可以不相等，它反映主动释放的旧帧；最终曝光同步仍需示波器或快速闪光。
+
+可复制最新同步运行并用 Python 3 标准库复算本报告的完成端吞吐和均值：
+
+```bash
+mkdir -p /tmp/mipi_sync_report
+RUN_DIR="$(ssh root@"$BOARD_IP" \
+  'find /root/mipi_vse_bpu_zerocopy/logs -maxdepth 1 -type d -name "run_*" | sort | tail -1')"
+scp root@"$BOARD_IP":"$RUN_DIR"/{events.jsonl,summary.json} /tmp/mipi_sync_report/
+python3 - <<'PY'
+import json
+
+root = '/tmp/mipi_sync_report'
+events = [json.loads(line) for line in open(f'{root}/events.jsonl')]
+summary = json.load(open(f'{root}/summary.json'))
+processed = sorted(
+    (e for e in events
+     if (e['component'], e['event']) == ('worker', 'frame_processed')),
+    key=lambda e: e['monotonic_us'])
+by_channel = {
+    channel: sorted((e for e in processed if e['channel'] == channel),
+                    key=lambda e: e['monotonic_us'])
+    for channel in ('left', 'right')}
+assert all(len(by_channel[channel]) == 300 for channel in by_channel)
+span_s = (processed[-1]['monotonic_us'] - processed[0]['monotonic_us']) / 1e6
+pair_done = [max(by_channel['left'][i]['monotonic_us'],
+                 by_channel['right'][i]['monotonic_us'])
+             for i in range(300)]
+pair_span_s = (pair_done[-1] - pair_done[0]) / 1e6
+run_complete = next(
+    e for e in events
+    if (e['component'], e['event']) == ('summary', 'run_complete'))
+print('summary', json.dumps(summary, indent=2))
+print('sync', json.dumps(run_complete['fields'], indent=2))
+print('aggregate_intercompletion_fps', 599 / span_s)
+print('pair_intercompletion_fps', 299 / pair_span_s)
+for channel in ('left', 'right'):
+    frames = by_channel[channel]
+    print(channel, {
+        name: sum(e['fields'][name] for e in frames) / len(frames)
+        for name in ('bpu_ms', 'postprocess_ms', 'end_to_end_ms')})
+PY
 ```
 
 若板端已安装 jq，可查看最新 summary、地址/core 和事件计数：
@@ -345,6 +486,7 @@ PY
 ```bash
 docker exec "$CONTAINER" bash -lc '
   cd /project/mipi_vse_bpu_zerocopy
+  cmake -DPROJECT_SOURCE_DIR="$PWD" -P test/check_hardware_sync_config.cmake
   cmake -DPROJECT_SOURCE_DIR="$PWD" -P test/check_no_image_copy.cmake
   ./build.sh
 '
@@ -355,9 +497,11 @@ ssh root@"$BOARD_IP" \
   'set -e; for test in /tmp/mipi_zerocopy_tests/test_*; do echo "RUN $test"; "$test"; done'
 ```
 
-## 12. 结论与限制
+## 13. 结论与限制
 
-本次测量直接证明：应用在 200 次成功推理中保持 VSE 与 DNN 输入物理地址一致，两路注册缓存行为与各 3 个 VSE buffer 相符，双 worker/双模型均提交到 `bpu_core0`，运行无 timeout、处理失败或释放错误。本次首末完成区间速率为 31.550388 aggregate FPS、15.778467 paired FPS；它不是稳态证明。BPU wait 主导约 60 ms 的 BPU total，CPU 后处理平均约 3.3 ms；因此首要优化对象是单 core 的模型执行/调度路径，而不是扩大队列或优先微调平均后处理。
+两组测量共同证明：应用可见路径保持 VSE 与 DNN 输入物理地址一致，两路注册缓存行为与各 3 个 VSE buffer 相符，双 worker/双模型均提交到 `bpu_core0`。原 100 帧基线得到 200/200 次地址一致和 15.778467 pair/s 首末完成区间速率；硬件同步改造后的 300 对验收得到 600/600 次地址一致、0 timeout/error/release error/address mismatch、15.745381 pair/s，并把所有已提交 pair 的硬件时间戳最大差限制在 78,750 raw tick。BPU wait/total 仍约 59–60 ms，CPU 后处理平均约 3.1–3.3 ms；首要性能优化对象仍是单 core 的模型执行/调度路径。
+
+同步改造解决了两个独立问题：SC132GS 通过 `SLAVE_M + LPWM` 接收周期硬件触发；处理反压导致左右 VSE 跳过不同帧时，应用按硬件时间戳释放旧帧并重新对齐，而不再按取帧顺序误配相邻曝光周期。它证明的是 SDK 时间戳域内的软件同周期配对稳定，不替代曝光电气边沿测量。
 
 结论适用范围受以下限制约束：
 
@@ -365,7 +509,10 @@ ssh root@"$BOARD_IP" \
 - 100 帧 P99 几乎由最慢 1–2 个样本决定，仅供探索，不作为性能认证或优化验收；P95/P99 验收应采用每路每次至少 1000 帧、多次运行并报告跨运行离散度或置信区间。
 - 后处理阶段只有每路 2 个 debug 样本，`percentiles_robust=false`，仅能解释机制；即使扩展到每路至少 30 个 debug 样本，也只用于阶段构成和均值的初步观察。
 - `worker.end_to_end_ms` 从 worker 出队后开始，不包含曝光到 VSE 输出、主线程取帧和排队，也不包含 VSE frame release；它包含 processor 内同步日志入队开销，但排除异步 writer 的序列化/文件 I/O 和随后提交的 `worker.frame_processed` 事件。当前没有曝光到检测输出的真正全链路时间。
+- 300 对验收的 `timestamps` 单位未从官方 SDK 定义得到确认；虽然序列增量呈 ns 量级，本报告仍使用 raw tick，不把 78,750 tick 直接作为正式微秒指标。
+- 未使用示波器或快速闪光测量两颗 SC132GS 的 FSIN/曝光窗口，因此不能仅凭 LPWM 配置和 VSE 时间戳宣称电气层“绝对同时曝光”。
+- 同步统计只每 30 对记录一个抽样事件；78,750 来自程序对全部 pair 的在线最大值，但当前日志不能离线重建全部 300 个 skew 的 P95/P99 分布。
 - 未记录 BPU/CPU/DDR 频率、温度、功耗模式和功耗数据，不能判断热降频、能效或功耗上限。
 - `wait_ms` 合并了 BPU runtime 排队与执行，现有日志无法量化二者各自占比。
-- 200/200 地址相等与静态门禁只覆盖应用可见路径，不用于宣称 SDK/驱动/硬件内部绝无复制。
+- 100 帧基线的 200/200、同步验收的 600/600 地址相等与静态门禁只覆盖应用可见路径，不用于宣称 SDK、驱动或硬件内部绝无复制。
 - 左右尾延迟存在差异，但 100 帧样本和缺失的系统状态不足以给出因果归属；相关解释均应视为待验证的工程推断，而非测量事实。
