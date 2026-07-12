@@ -19,6 +19,14 @@ int failures = 0;
 }  // namespace
 
 int main() {
+  const auto sync = zerocopy::sc132gsHardwareSyncTiming();
+  CHECK(sync.fps == 30);
+  CHECK(sync.period_us == 33333);
+  CHECK(sync.offset_us == 10);
+  CHECK(sync.duty_us == 100);
+  CHECK(sync.trigger_source == 0);
+  CHECK(sync.trigger_mode == 0);
+
   CHECK(!zerocopy::shouldSetMclkAttribute(false));
   CHECK(zerocopy::shouldSetMclkAttribute(true));
   const auto host0 = zerocopy::makeSensorRouting(0, 0, 4);

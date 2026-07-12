@@ -4,6 +4,10 @@
 
 namespace zerocopy {
 
+HardwareSyncTiming sc132gsHardwareSyncTiming() noexcept {
+  return {30, 33333, 10, 100, 0, 0};
+}
+
 bool shouldSetMclkAttribute(bool device_tree_has_pinctrl_names) noexcept {
   return device_tree_has_pinctrl_names;
 }

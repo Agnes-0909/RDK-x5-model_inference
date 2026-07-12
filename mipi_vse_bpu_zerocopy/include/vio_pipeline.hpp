@@ -4,6 +4,7 @@
 #include "vse_frame.hpp"
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -13,6 +14,17 @@
 namespace zerocopy {
 
 class AsyncLogger;
+
+struct HardwareSyncTiming {
+  int fps = 0;
+  std::uint32_t period_us = 0;
+  std::uint32_t offset_us = 0;
+  std::uint32_t duty_us = 0;
+  std::uint32_t trigger_source = 0;
+  std::uint32_t trigger_mode = 0;
+};
+
+HardwareSyncTiming sc132gsHardwareSyncTiming() noexcept;
 
 bool shouldSetMclkAttribute(bool device_tree_has_pinctrl_names) noexcept;
 
