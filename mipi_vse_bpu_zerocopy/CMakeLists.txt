@@ -17,6 +17,7 @@ add_library(mipi_zerocopy_core STATIC
   src/dual_channel_coordinator.cpp
   src/cleanup_stack.cpp
   src/registered_buffer_cache.cpp
+  src/stereo_frame_sync.cpp
   src/tensor_binding.cpp
   src/vse_frame.cpp
   src/yolo11_postprocess.cpp
@@ -53,6 +54,10 @@ add_test(NAME test_geometry_and_layout COMMAND test_geometry_and_layout)
 add_executable(test_resource_lifecycle test/test_resource_lifecycle.cpp)
 target_link_libraries(test_resource_lifecycle PRIVATE mipi_zerocopy_core)
 add_test(NAME test_resource_lifecycle COMMAND test_resource_lifecycle)
+
+add_executable(test_stereo_frame_sync test/test_stereo_frame_sync.cpp)
+target_link_libraries(test_stereo_frame_sync PRIVATE mipi_zerocopy_core)
+add_test(NAME test_stereo_frame_sync COMMAND test_stereo_frame_sync)
 
 add_executable(test_yolo11_postprocess test/test_yolo11_postprocess.cpp)
 target_link_libraries(test_yolo11_postprocess PRIVATE mipi_zerocopy_core)

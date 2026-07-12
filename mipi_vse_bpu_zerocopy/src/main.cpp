@@ -1,6 +1,7 @@
 #include "app_config.hpp"
 #include "async_logger.hpp"
 #include "dual_channel_coordinator.hpp"
+#include "stereo_frame_sync.hpp"
 #include "vio_pipeline.hpp"
 #include "zero_copy_channel_processor.hpp"
 
@@ -17,6 +18,8 @@
 namespace {
 
 std::atomic_bool signal_stop_requested{false};
+constexpr uint64_t kMaxStereoPairSkewTicks = 1'000'000ULL;
+constexpr int kMaxStereoRealignmentSteps = 16;
 
 void handleSignal(int) { signal_stop_requested.store(true); }
 
@@ -126,6 +129,8 @@ int main(int argc, char** argv) {
   uint64_t left_timeouts = 0;
   uint64_t right_timeouts = 0;
   uint64_t max_timestamp_skew = 0;
+  uint64_t left_sync_drops = 0;
+  uint64_t right_sync_drops = 0;
   zerocopy::DualChannelSummary summary;
 
   const int memory_result = hb_mem_module_open();
@@ -168,11 +173,55 @@ int main(int argc, char** argv) {
                   static_cast<uint64_t>(config.frames))) {
           zerocopy::VseFrame left_frame;
           zerocopy::VseFrame right_frame;
-          const bool left_ok =
+          bool left_ok =
               pipelines.acquireLeft(config.frame_timeout_ms, left_frame);
-          if (!left_ok) ++left_timeouts;
-          const bool right_ok =
+          bool right_ok =
               pipelines.acquireRight(config.frame_timeout_ms, right_frame);
+          int realignment_steps = 0;
+          zerocopy::StereoFrameSyncDecision sync_decision;
+          while (left_ok && right_ok) {
+            sync_decision = zerocopy::decideStereoFrameSync(
+                left_frame.hardwareTimestamp(), right_frame.hardwareTimestamp(),
+                kMaxStereoPairSkewTicks);
+            if (sync_decision.action ==
+                zerocopy::StereoFrameSyncAction::kPair) {
+              break;
+            }
+            if (sync_decision.action ==
+                zerocopy::StereoFrameSyncAction::kTimestampMissing) {
+              throw std::runtime_error(
+                  "hardware timestamp missing; stereo exposure cannot be aligned");
+            }
+            if (++realignment_steps > kMaxStereoRealignmentSteps) {
+              throw std::runtime_error(
+                  "unable to align stereo frames within 16 refreshes");
+            }
+
+            const bool refresh_left =
+                sync_decision.action ==
+                zerocopy::StereoFrameSyncAction::kRefreshLeft;
+            zerocopy::VseFrame& stale_frame =
+                refresh_left ? left_frame : right_frame;
+            logger.log(
+                {zerocopy::LogLevel::kDebug, "sync", "stale_frame_dropped",
+                 "main", refresh_left ? "left" : "right",
+                 static_cast<int64_t>(stale_frame.frameId()),
+                 "older frame released while aligning stereo timestamps",
+                 {{"left_timestamp", left_frame.hardwareTimestamp()},
+                  {"right_timestamp", right_frame.hardwareTimestamp()},
+                  {"skew_ticks", sync_decision.skew_ticks}}});
+            stale_frame.release();
+            if (refresh_left) {
+              ++left_sync_drops;
+              left_ok =
+                  pipelines.acquireLeft(config.frame_timeout_ms, left_frame);
+            } else {
+              ++right_sync_drops;
+              right_ok =
+                  pipelines.acquireRight(config.frame_timeout_ms, right_frame);
+            }
+          }
+          if (!left_ok) ++left_timeouts;
           if (!right_ok) ++right_timeouts;
           if (!left_ok || !right_ok) {
             ++consecutive_timeouts;
@@ -188,10 +237,7 @@ int main(int argc, char** argv) {
           consecutive_timeouts = 0;
           const uint64_t left_timestamp = left_frame.hardwareTimestamp();
           const uint64_t right_timestamp = right_frame.hardwareTimestamp();
-          const uint64_t timestamp_skew =
-              left_timestamp > right_timestamp
-                  ? left_timestamp - right_timestamp
-                  : right_timestamp - left_timestamp;
+          const uint64_t timestamp_skew = sync_decision.skew_ticks;
           max_timestamp_skew =
               std::max(max_timestamp_skew, timestamp_skew);
           if ((dispatched % 30U) == 0U) {
@@ -255,8 +301,10 @@ int main(int argc, char** argv) {
                     summary.right.address_mismatches},
                {"errors", summary.left.failures + summary.right.failures},
                {"exit_code", int64_t{exit_code}},
+               {"left_sync_drops", left_sync_drops},
                {"left_success", summary.left.successes},
                {"max_timestamp_skew_ticks", max_timestamp_skew},
+               {"right_sync_drops", right_sync_drops},
                {"right_success", summary.right.successes}}});
   logger.shutdown();
   return exit_code;
