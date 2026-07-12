@@ -63,7 +63,17 @@ void cloneSensorConfig(Pipeline& pipeline, int host) {
   pipeline.isp_attr = *source.isp_attr;
   pipeline.isp_ichn_attr = *source.isp_ichn_attr;
   pipeline.isp_ochn_attr = *source.isp_ochn_attr;
-  pipeline.vin_node_attr.lpwm_attr.enable = 0;
+  const auto sync = sc132gsHardwareSyncTiming();
+  pipeline.vin_node_attr.lpwm_attr.enable = 1;
+  for (auto& channel : pipeline.vin_node_attr.lpwm_attr.lpwm_chn_attr) {
+    channel.trigger_source = sync.trigger_source;
+    channel.trigger_mode = sync.trigger_mode;
+    channel.period = sync.period_us;
+    channel.offset = sync.offset_us;
+    channel.duty_time = sync.duty_us;
+    channel.threshold = 0;
+    channel.adjust_step = 0;
+  }
   pipeline.isp_attr.input_mode = 2;
 }
 

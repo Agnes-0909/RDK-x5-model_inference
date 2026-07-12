@@ -2,7 +2,7 @@
 
 #define SENSOR_WIDTH 1088
 #define SENSOR_HEIGHT 1280
-#define SENSOR_FPS 60
+#define SENSOR_FPS 30
 #define RAW10 0x2B
 
 static mipi_config_t mipi_config = {
@@ -27,7 +27,7 @@ static mipi_config_t mipi_config = {
 static camera_config_t camera_config = {
     .name = "sc132gs",
     .addr = 0x33,
-    .sensor_mode = 1,
+    .sensor_mode = SLAVE_M,
     .fps = SENSOR_FPS,
     .format = RAW10,
     .width = SENSOR_WIDTH,
@@ -50,7 +50,39 @@ static vin_node_attr_t vin_node_attr = {
                           .time_stamp_mode = 3,
                           .ts_src = 1,
                           .pps_src = 6}},
-    .lpwm_attr = {.enable = 0},
+    .lpwm_attr = {
+        .enable = 1,
+        .lpwm_chn_attr = {
+            {.trigger_source = 0,
+             .trigger_mode = 0,
+             .period = 33333,
+             .offset = 10,
+             .duty_time = 100,
+             .threshold = 0,
+             .adjust_step = 0},
+            {.trigger_source = 0,
+             .trigger_mode = 0,
+             .period = 33333,
+             .offset = 10,
+             .duty_time = 100,
+             .threshold = 0,
+             .adjust_step = 0},
+            {.trigger_source = 0,
+             .trigger_mode = 0,
+             .period = 33333,
+             .offset = 10,
+             .duty_time = 100,
+             .threshold = 0,
+             .adjust_step = 0},
+            {.trigger_source = 0,
+             .trigger_mode = 0,
+             .period = 33333,
+             .offset = 10,
+             .duty_time = 100,
+             .threshold = 0,
+             .adjust_step = 0},
+        },
+    },
 };
 
 static vin_attr_ex_t vin_attr_ex = {

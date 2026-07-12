@@ -71,6 +71,11 @@ add_test(NAME no_image_copy
     -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
     -P ${CMAKE_CURRENT_SOURCE_DIR}/test/check_no_image_copy.cmake)
 
+add_test(NAME hardware_sync_config
+  COMMAND ${CMAKE_COMMAND}
+    -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/check_hardware_sync_config.cmake)
+
 option(BUILD_HARDWARE_APP "Build the RDK X5 hardware executable" ON)
 
 set(DNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../3rdlibrary/DNN" CACHE PATH
