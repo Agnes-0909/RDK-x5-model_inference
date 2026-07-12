@@ -19,7 +19,7 @@
 采用 X5 VIN LPWM 双通道同参数触发：
 
 1. 将两颗 SC132GS 的 camera sensor mode 切换到 `SLAVE_M`。
-2. 将 ISP sensor mode 配置为对应的 slave 模式。
+2. ISP 保持 `ISP_NORMAL_M`；`SLAVE_M` 仅用于传感器外部触发模式，不能误配为 ISP/HDR 模式。
 3. 启用 VIN `lpwm_attr`，由每路设备树路由选择 LPWM 通道。
 4. 两路使用相同触发参数：周期 33333 微秒、相同 offset、相同 duty time 和 trigger mode。
 5. 先完成左右两路全部节点、flow 和触发参数配置，再启动两路 flow，减少启动阶段的非确定性。
