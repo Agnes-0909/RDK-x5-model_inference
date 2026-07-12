@@ -11,11 +11,11 @@ docker exec 3c543521b4ca bash -lc \
   'cd /project/mipi_vse_bpu_zerocopy && ./build.sh'
 ```
 
-本功能分支的隔离工作树路径为：
+本次硬件同步功能的隔离工作树路径为：
 
 ```bash
 docker exec 3c543521b4ca bash -lc \
-  'cd /project/.worktrees/dual-worker-observability/mipi_vse_bpu_zerocopy && ./build.sh'
+  'cd /project/.worktrees/sc132gs-hardware-sync/mipi_vse_bpu_zerocopy && ./build.sh'
 ```
 
 输出为 `build_aarch64/mipi_vse_bpu_zerocopy`。
@@ -40,6 +40,23 @@ LOG_ROOT=/root/mipi_vse_bpu_zerocopy/logs LOG_LEVEL=debug \
 ```
 
 还可用 `LOG_MAX_MB` 和 `LOG_FILES` 调整轮转，默认每个日志文件 100 MB、保留 5 份。应用参数可通过 `./mipi_vse_bpu_zerocopy --help` 查看。
+
+## 双摄硬件同步
+
+左右 SC132GS 均工作在 `SLAVE_M`，由各自相机接口路由的 X5 LPWM 通道以相同参数持续触发曝光：30 FPS、周期 33333 µs、offset 10 µs、脉宽 100 µs。ISP 仍使用 `ISP_NORMAL_M`。程序会先完成左右两路 VIO flow 的全部配置，再启动两路 flow；推理和后处理仍保持流水执行，不等待上一对图像处理结束后再曝光。
+
+由于两路推理共享一个 BPU 核，处理速度低于 30 FPS 相机帧率，VSE 取帧时可能跳过不同数量的帧。程序不会按左右取帧顺序直接配对，而是要求硬件时间戳差不超过 1,000,000 tick；超过阈值时释放时间戳较旧的一路并重新取帧。`left_sync_drops` 和 `right_sync_drops` 是为恢复同曝光配对而主动丢弃的帧数，不是推理失败。
+
+每 30 对图像会记录一次 `sync.stereo_sync_sample`，字段包括左右 frame id、原始硬件时间戳、`skew_ticks` 和运行期间 `max_skew_ticks`：
+
+```bash
+jq -c 'select(.component == "sync" and .event == "stereo_sync_sample")' \
+  "${RUN_DIR}/events.jsonl"
+```
+
+`skew_ticks` 是 SDK 返回的原始时间戳 tick；在板端确认时钟单位之前，不应直接解释为微秒。软件配置和时间戳接近只能作为同步证据之一。GS130W 必须把两颗传感器的外部触发脚接到相应 LPWM，且两个 LPWM 通道必须同相。如果两个通道存在稳定相位差，应将一个硬件触发信号物理扇出到两颗传感器，并用示波器或同时照射两颗传感器的快速闪光再次确认曝光同步。
+
+2026-07-12 在 `root@192.168.1.12` 连续运行 300 对的实测结果为：左右各成功推理 300 帧、取帧超时 0、推理错误 0、零拷贝地址不一致 0，配对后的最大时间戳差为 78,750 tick。该结果证明软件时间戳配对稳定；曝光电气边沿是否完全同步仍以示波器或快速闪光测试为最终依据。
 
 ## 日志与统计
 
