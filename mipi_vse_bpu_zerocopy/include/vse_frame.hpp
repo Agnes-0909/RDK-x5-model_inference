@@ -14,7 +14,7 @@ class VseFrame {
 
   VseFrame() = default;
   VseFrame(std::uint64_t frame_id, BufferLayout layout,
-           ReleaseFunction release);
+           ReleaseFunction release, std::uint64_t hardware_timestamp = 0);
   ~VseFrame();
 
   VseFrame(const VseFrame&) = delete;
@@ -24,11 +24,13 @@ class VseFrame {
 
   bool valid() const noexcept;
   std::uint64_t frameId() const noexcept;
+  std::uint64_t hardwareTimestamp() const noexcept;
   const BufferLayout& layout() const noexcept;
   int release() noexcept;
 
  private:
   std::uint64_t frame_id_ = 0;
+  std::uint64_t hardware_timestamp_ = 0;
   BufferLayout layout_;
   ReleaseFunction release_;
   bool valid_ = false;

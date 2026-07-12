@@ -33,17 +33,18 @@ zerocopy::BufferLayout layout() {
   return value;
 }
 
-zerocopy::VseFrame frame(uint64_t id, std::atomic<int>& releases) {
+zerocopy::VseFrame frame(uint64_t id, std::atomic<int>& releases,
+                         uint64_t hardware_timestamp = 0) {
   return zerocopy::VseFrame(id, layout(), [&releases] {
     ++releases;
     return 0;
-  });
+  }, hardware_timestamp);
 }
 
 void testMoveOwnershipAndFifo() {
   std::atomic<int> releases{0};
   zerocopy::BoundedFrameQueue queue;
-  auto input = frame(7, releases);
+  auto input = frame(7, releases, 123456);
   const auto pushed = queue.push(std::move(input));
   CHECK(pushed.accepted);
   CHECK(!input.valid());
@@ -53,6 +54,7 @@ void testMoveOwnershipAndFifo() {
   const auto popped = queue.pop(output);
   CHECK(popped.has_frame);
   CHECK(output.frameId() == 7);
+  CHECK(output.hardwareTimestamp() == 123456);
   CHECK(queue.size() == 0);
   output.release();
   CHECK(releases == 1);

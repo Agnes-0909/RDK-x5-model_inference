@@ -4,6 +4,7 @@
 #include "vio_pipeline.hpp"
 #include "zero_copy_channel_processor.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <fstream>
@@ -124,6 +125,7 @@ int main(int argc, char** argv) {
   std::string fatal_error;
   uint64_t left_timeouts = 0;
   uint64_t right_timeouts = 0;
+  uint64_t max_timestamp_skew = 0;
   zerocopy::DualChannelSummary summary;
 
   const int memory_result = hb_mem_module_open();
@@ -184,6 +186,26 @@ int main(int argc, char** argv) {
             continue;
           }
           consecutive_timeouts = 0;
+          const uint64_t left_timestamp = left_frame.hardwareTimestamp();
+          const uint64_t right_timestamp = right_frame.hardwareTimestamp();
+          const uint64_t timestamp_skew =
+              left_timestamp > right_timestamp
+                  ? left_timestamp - right_timestamp
+                  : right_timestamp - left_timestamp;
+          max_timestamp_skew =
+              std::max(max_timestamp_skew, timestamp_skew);
+          if ((dispatched % 30U) == 0U) {
+            logger.log(
+                {zerocopy::LogLevel::kInfo, "sync", "stereo_sync_sample",
+                 "main", "", static_cast<int64_t>(left_frame.frameId()),
+                 "left/right hardware timestamp skew",
+                 {{"left_frame_id", left_frame.frameId()},
+                  {"left_timestamp", left_timestamp},
+                  {"max_skew_ticks", max_timestamp_skew},
+                  {"right_frame_id", right_frame.frameId()},
+                  {"right_timestamp", right_timestamp},
+                  {"skew_ticks", timestamp_skew}}});
+          }
           if (!coordinator.enqueuePair(std::move(left_frame),
                                        std::move(right_frame))) {
             break;
@@ -234,6 +256,7 @@ int main(int argc, char** argv) {
                {"errors", summary.left.failures + summary.right.failures},
                {"exit_code", int64_t{exit_code}},
                {"left_success", summary.left.successes},
+               {"max_timestamp_skew_ticks", max_timestamp_skew},
                {"right_success", summary.right.successes}}});
   logger.shutdown();
   return exit_code;

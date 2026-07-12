@@ -250,11 +250,13 @@ class DualVioPipeline::Impl {
                                    : "VSE frame release failed",
                {{"result", static_cast<int64_t>(release_result)}});
           return release_result;
-        });
+        },
+        image.info.timestamps);
     const auto layout = frame.layout();
     emit(LogLevel::kDebug, "frame_acquired", pipeline.channel,
          static_cast<int64_t>(image.info.frame_id), "VSE output frame acquired",
-         {{"height", int64_t{layout.height}},
+         {{"hardware_timestamp", image.info.timestamps},
+          {"height", int64_t{layout.height}},
           {"physical_address", layout.y_phy},
           {"width", int64_t{layout.width}}});
     last_error_.clear();
